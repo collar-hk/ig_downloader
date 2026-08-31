@@ -27,10 +27,11 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 IG_USERNAME = os.environ.get("IG_USERNAME")
 IG_PASSWORD = os.environ.get("IG_PASSWORD")
 
-# --- Concurrency & Timeout Settings ---
+# --- State & Cache Settings ---
 MAX_TASKS_PER_USER = 2
 DOWNLOAD_TIMEOUT_SECONDS = 120
 user_active_tasks = defaultdict(int)
+USER_ID_CACHE = {}  # Caches numeric User IDs to bypass 429 rate limits on web_profile_info
 
 # --- Initial Login & Session Creation ---
 if IG_USERNAME:
@@ -58,8 +59,6 @@ else:
 # --- Background Download Functions (Thread-Safe) ---
 def get_thread_safe_loader():
     """Creates a fresh, isolated Instaloader instance for the current background thread."""
-    
-    # Force socket timeout to prevent dead threads from silent IG drops
     socket.setdefaulttimeout(15)
     
     local_L = instaloader.Instaloader(
@@ -87,17 +86,25 @@ def download_post_sync(shortcode, target_dir):
 def download_story_sync(username, media_id, target_dir):
     try:
         local_L = get_thread_safe_loader()
-        profile = instaloader.Profile.from_username(local_L.context, username)
         
-        for story in local_L.get_stories(userids=[profile.userid]):
+        # 1. Check Cache to bypass the protected web_profile_info endpoint
+        if username in USER_ID_CACHE:
+            user_id = USER_ID_CACHE[username]
+            logger.info(f"Cache hit for {username} (ID: {user_id}). Bypassing profile API.")
+        else:
+            logger.info(f"Cache miss for {username}. Fetching from Instagram API...")
+            profile = instaloader.Profile.from_username(local_L.context, username)
+            user_id = profile.userid
+            USER_ID_CACHE[username] = user_id
+            
+        # 2. Fetch stories directly using the numeric User ID
+        for story in local_L.get_stories(userids=[user_id]):
             for item in story.get_items():
                 if media_id:
-                    # Target exactly one story ID
                     if str(item.mediaid).startswith(media_id):
                         local_L.download_storyitem(item, target=target_dir)
                         return 
                 else:
-                    # Download all active stories for the user
                     local_L.download_storyitem(item, target=target_dir)
     except Exception as e:
         raise Exception(f"Failed to fetch story: {str(e)}")
@@ -124,7 +131,6 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
     if "instagram.com" not in text:
         return
 
-    # Extract shortcode/username cleanly, ignoring tracking parameters
     post_match = re.search(r"/(?:p|reel|tv)/([^/?#&]+)", text)
     story_match = re.search(r"/stories/([^/?#&]+)(?:/([^/?#&]+))?", text)
 
