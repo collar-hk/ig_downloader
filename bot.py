@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Instagram downloader Telegram bot."""
+"""Instagram downloader Telegram bot with multi-session rotation."""
 
 from __future__ import annotations
 
@@ -37,18 +37,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-IG_USERNAME = os.environ.get("IG_USERNAME")
 ADMIN_RAW = os.environ.get("ADMIN_TELEGRAM_IDS", "")
 ADMIN_TELEGRAM_IDS = {int(x.strip()) for x in ADMIN_RAW.split(",") if x.strip().isdigit()}
 
 MAX_TASKS_PER_USER = 2
-MAX_GLOBAL_DOWNLOADS = 3
+MAX_GLOBAL_DOWNLOADS = 5
 DOWNLOAD_TIMEOUT_SECONDS = 120
 TELEGRAM_MEDIA_GROUP_LIMIT = 10
 MEDIA_SUFFIXES = {".mp4", ".jpg", ".jpeg", ".png", ".webp"}
 
 CACHE_PATH = Path(os.environ.get("USER_ID_CACHE_PATH", "user_id_cache.json"))
-SESSION_FILE = Path(f"ig_session_{IG_USERNAME}") if IG_USERNAME else None
 
 INSTAGRAM_HOST_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am)/", re.I)
 POST_RE = re.compile(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", re.I)
@@ -60,6 +58,10 @@ _tls = threading.local()
 _global_download_sema: asyncio.Semaphore | None = None
 _slot_lock: asyncio.Lock | None = None
 
+# Session Rotation State
+_session_lock = threading.Lock()
+_session_index = 0
+
 
 class DownloadError(Exception):
     """User-facing download failure."""
@@ -67,6 +69,27 @@ class DownloadError(Exception):
 
 def _normalize_username(username: str) -> str:
     return username.strip().lstrip("@").lower()
+
+
+def get_available_session_files() -> list[Path]:
+    """Find all files starting with 'ig_session_' in the working directory."""
+    return sorted(list(Path(".").glob("ig_session_*")))
+
+
+def get_next_session_file() -> tuple[str, Path] | tuple[None, None]:
+    """Get the next session file using round-robin rotation."""
+    global _session_index
+    session_files = get_available_session_files()
+    if not session_files:
+        return None, None
+
+    with _session_lock:
+        selected_file = session_files[_session_index % len(session_files)]
+        _session_index = (_session_index + 1) % len(session_files)
+
+    # File format is expected to be `ig_session_username`
+    username = selected_file.name.replace("ig_session_", "")
+    return username, selected_file
 
 
 def load_user_id_cache() -> None:
@@ -111,7 +134,7 @@ def cache_set(username: str, user_id: int) -> None:
 
 
 def get_user_id_from_public_html(username: str) -> int | None:
-    """Enhanced profile_id scrape supporting authenticated cookies & expanded regex patterns."""
+    """Scrape profile_id from public HTML, optionally attaching session cookies."""
     url = f"https://www.instagram.com/{username}/"
     headers = {
         "User-Agent": (
@@ -122,10 +145,9 @@ def get_user_id_from_public_html(username: str) -> int | None:
         "Sec-Fetch-Mode": "navigate",
     }
     
-    # Attach session cookie if available to bypass the login redirect
-    if IG_USERNAME and SESSION_FILE and SESSION_FILE.exists():
+    loader, _ = get_thread_safe_loader()
+    if loader and loader.context._session.cookies:
         try:
-            loader = get_thread_safe_loader()
             session_cookies = loader.context._session.cookies
             cookie_str = "; ".join([f"{c.name}={c.value}" for c in session_cookies])
             headers["Cookie"] = cookie_str
@@ -140,7 +162,6 @@ def get_user_id_from_public_html(username: str) -> int | None:
         logger.warning("HTML fallback request failed for @%s: %s", username, exc)
         return None
 
-    # Expanded regex matching escaped quotes, meta tags, and alternate JSON fields
     patterns = [
         r'\\"profile_id\\":\\"(\d+)\\"',
         r'"profile_id":"(\d+)"',
@@ -163,10 +184,13 @@ def get_user_id_from_public_html(username: str) -> int | None:
     return None
 
 
-def get_thread_safe_loader() -> instaloader.Instaloader:
+def get_thread_safe_loader(rotate_session: bool = False) -> tuple[instaloader.Instaloader, str | None]:
+    """Gets thread-local Instaloader instance, cycling to next session if requested."""
     loader = getattr(_tls, "loader", None)
-    if loader is not None:
-        return loader
+    current_user = getattr(_tls, "current_username", None)
+
+    if loader is not None and not rotate_session:
+        return loader, current_user
 
     loader = instaloader.Instaloader(
         filename_pattern="{date_utc:%Y-%m-%d}_{profile}_{typename}_{mediaid}",
@@ -181,14 +205,19 @@ def get_thread_safe_loader() -> instaloader.Instaloader:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     )
-    if IG_USERNAME and SESSION_FILE and SESSION_FILE.exists():
+
+    ig_user, session_path = get_next_session_file()
+    if ig_user and session_path and session_path.exists():
         try:
-            loader.load_session_from_file(IG_USERNAME, str(SESSION_FILE))
+            loader.load_session_from_file(ig_user, str(session_path))
+            logger.info("Thread %s using session file: %s", threading.get_ident(), session_path.name)
         except (OSError, instaloader.exceptions.InstaloaderException) as exc:
-            logger.error("Failed to load session file %s: %s", SESSION_FILE, exc)
+            logger.error("Failed to load session file %s: %s", session_path, exc)
+            ig_user = None
 
     _tls.loader = loader
-    return loader
+    _tls.current_username = ig_user
+    return loader, ig_user
 
 
 def _friendly_filename(name: str) -> str:
@@ -204,15 +233,9 @@ def _friendly_filename(name: str) -> str:
     return name
 
 
-def _is_rate_limited(exc: BaseException) -> bool:
-    text = str(exc)
-    return "429" in text or "Too Many Requests" in text
-
-
 def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) -> int:
     username = _normalize_username(username)
     
-    # 1. Check local cache first
     cached = cache_get(username)
     if cached is not None:
         logger.info("Cache hit for @%s (ID %s)", username, cached)
@@ -220,13 +243,11 @@ def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) ->
 
     logger.info("Cache miss for @%s; attempting resolution", username)
 
-    # 2. Try fast HTML scraping first (bypasses GraphQL rate limits)
     user_id = get_user_id_from_public_html(username)
     if user_id:
         cache_set(username, user_id)
         return user_id
 
-    # 3. Fallback to Instaloader Profile lookup if HTML scraping fails
     try:
         logger.info("HTML lookup failed for @%s; trying Instaloader API", username)
         profile = instaloader.Profile.from_username(loader.context, username)
@@ -241,14 +262,21 @@ def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) ->
 
 
 def download_post_sync(shortcode: str, target_dir: str) -> None:
-    try:
-        loader = get_thread_safe_loader()
-        post = instaloader.Post.from_shortcode(loader.context, shortcode)
-        loader.download_post(post, target=Path(target_dir))
-    except DownloadError:
-        raise
-    except Exception as exc:
-        raise DownloadError(f"Failed to fetch that post or reel: {exc}") from exc
+    session_files = get_available_session_files()
+    attempts = max(1, len(session_files))
+
+    for attempt in range(attempts):
+        try:
+            loader, current_user = get_thread_safe_loader(rotate_session=(attempt > 0))
+            post = instaloader.Post.from_shortcode(loader.context, shortcode)
+            loader.download_post(post, target=Path(target_dir))
+            return
+        except DownloadError:
+            raise
+        except Exception as exc:
+            logger.warning("Attempt %s failed with session '%s': %s", attempt + 1, current_user, exc)
+            if attempt == attempts - 1:
+                raise DownloadError(f"Failed to fetch that post or reel: {exc}") from exc
 
 
 def _story_item_matches(item: Any, media_id: str | None) -> bool:
@@ -260,33 +288,39 @@ def _story_item_matches(item: Any, media_id: str | None) -> bool:
 
 def download_story_sync(username: str, media_id: str | None, target_dir: str) -> None:
     username = _normalize_username(username)
-    try:
-        loader = get_thread_safe_loader()
-        user_id = resolve_instagram_user_id(loader, username)
-        found = False
-        for story in loader.get_stories(userids=[user_id]):
-            for item in story.get_items():
-                if not _story_item_matches(item, media_id):
-                    continue
-                loader.download_storyitem(item, target=Path(target_dir))
-                found = True
-                if media_id:
-                    break
-            if found and media_id:
-                break
+    session_files = get_available_session_files()
+    attempts = max(1, len(session_files))
 
-        if not found and media_id:
-            raise DownloadError("That story was not found or has expired.")
-        if not found:
-            raise DownloadError("No active stories found for that account.")
-    except DownloadError:
-        raise
-    except Exception as exc:
-        raise DownloadError(f"Failed to fetch that story: {exc}") from exc
+    for attempt in range(attempts):
+        try:
+            loader, current_user = get_thread_safe_loader(rotate_session=(attempt > 0))
+            user_id = resolve_instagram_user_id(loader, username)
+            found = False
+            for story in loader.get_stories(userids=[user_id]):
+                for item in story.get_items():
+                    if not _story_item_matches(item, media_id):
+                        continue
+                    loader.download_storyitem(item, target=Path(target_dir))
+                    found = True
+                    if media_id:
+                        break
+                if found and media_id:
+                    break
+
+            if not found and media_id:
+                raise DownloadError("That story was not found or has expired.")
+            if not found:
+                raise DownloadError("No active stories found for that account.")
+            return
+        except DownloadError:
+            raise
+        except Exception as exc:
+            logger.warning("Attempt %s failed for story @%s with session '%s': %s", attempt + 1, username, current_user, exc)
+            if attempt == attempts - 1:
+                raise DownloadError(f"Failed to fetch that story: {exc}") from exc
 
 
 def _flatten_target_directory(target_dir: str) -> list[Path]:
-    """Flattens all downloaded media files from subfolders to root target_dir."""
     target_path = Path(target_dir)
     media_files: list[Path] = []
 
@@ -434,7 +468,6 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
 
         await asyncio.sleep(0.5)
 
-        # Flatten any nested subfolders created by Instaloader
         entries = _flatten_target_directory(target_dir)
 
         if not entries:
@@ -451,7 +484,6 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
                 media_group.append(
                     InputMediaDocument(media=handle, filename=_friendly_filename(path.name))
                 )
-            # Group files into combined media galleries sent to the chat
             for i in range(0, len(media_group), TELEGRAM_MEDIA_GROUP_LIMIT):
                 await context.bot.send_media_group(
                     chat_id=chat_id,
@@ -480,6 +512,10 @@ async def _post_init(application: Application) -> None:
     _global_download_sema = asyncio.Semaphore(MAX_GLOBAL_DOWNLOADS)
     _slot_lock = asyncio.Lock()
     load_user_id_cache()
+    
+    sessions = get_available_session_files()
+    logger.info("Detected %d session file(s): %s", len(sessions), [s.name for s in sessions])
+    
     if not ADMIN_TELEGRAM_IDS:
         logger.warning("ADMIN_TELEGRAM_IDS is empty; /setid is disabled for everyone.")
     logger.info("Bot is ready.")
