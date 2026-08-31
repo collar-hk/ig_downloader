@@ -146,8 +146,9 @@ def get_thread_safe_loader() -> instaloader.Instaloader:
     if loader is not None:
         return loader
 
+    # Fixed: Removed {shortcode} from pattern so stories don't trigger KeyError
     loader = instaloader.Instaloader(
-        filename_pattern="{date_utc:%Y-%m-%d}_{profile}_{typename}_{shortcode}_{mediaid}",
+        filename_pattern="{date_utc:%Y-%m-%d}_{profile}_{typename}_{mediaid}",
         download_videos=True,
         download_video_thumbnails=False,
         save_metadata=False,
@@ -255,7 +256,7 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
     except DownloadError:
         raise
     except Exception as exc:
-        raise DownloadError("Failed to fetch that story.") from exc
+        raise DownloadError(f"Failed to fetch story: {exc}") from exc
 
 
 def _task_counts(context: ContextTypes.DEFAULT_TYPE) -> dict[int, int]:
@@ -386,13 +387,16 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
                 )
 
-        # Brief delay to allow background thread file writes to complete
         await asyncio.sleep(0.5)
 
-        # Move files out of subfolders to root target_dir if Instaloader nested them
-        for subpath in Path(target_dir).rglob("*"):
-            if subpath.is_file() and subpath.parent != Path(target_dir):
-                shutil.move(str(subpath), str(Path(target_dir) / subpath.name))
+        # Fixed: Safely collect files BEFORE moving to prevent rglob iterator corruption
+        files_to_move = [
+            p for p in Path(target_dir).rglob("*")
+            if p.is_file() and p.parent != Path(target_dir)
+        ]
+        for subpath in files_to_move:
+            dest = Path(target_dir) / subpath.name
+            shutil.move(str(subpath), str(dest))
 
         entries = [
             p
