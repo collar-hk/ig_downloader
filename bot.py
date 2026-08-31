@@ -146,7 +146,6 @@ def get_thread_safe_loader() -> instaloader.Instaloader:
     if loader is not None:
         return loader
 
-    # Fixed: Removed {shortcode} from pattern so stories don't trigger KeyError
     loader = instaloader.Instaloader(
         filename_pattern="{date_utc:%Y-%m-%d}_{profile}_{typename}_{mediaid}",
         download_videos=True,
@@ -218,11 +217,11 @@ def download_post_sync(shortcode: str, target_dir: str) -> None:
     try:
         loader = get_thread_safe_loader()
         post = instaloader.Post.from_shortcode(loader.context, shortcode)
-        loader.download_post(post, target=target_dir)
+        loader.download_post(post, target=Path(target_dir))
     except DownloadError:
         raise
     except Exception as exc:
-        raise DownloadError("Failed to fetch that post or reel.") from exc
+        raise DownloadError(f"Failed to fetch that post or reel: {exc}") from exc
 
 
 def _story_item_matches(item: Any, media_id: str | None) -> bool:
@@ -256,7 +255,28 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
     except DownloadError:
         raise
     except Exception as exc:
-        raise DownloadError(f"Failed to fetch story: {exc}") from exc
+        raise DownloadError(f"Failed to fetch that story: {exc}") from exc
+
+
+def _flatten_target_directory(target_dir: str) -> list[Path]:
+    """Flattens all downloaded media files from subfolders to root target_dir."""
+    target_path = Path(target_dir)
+    media_files: list[Path] = []
+
+    # Find all media files recursively
+    for path in list(target_path.rglob("*")):
+        if path.is_file() and path.suffix.lower() in MEDIA_SUFFIXES:
+            # If the file is inside a subfolder (e.g., target_dir/username/file.mp4), move it out
+            if path.parent != target_path:
+                dest = target_path / path.name
+                if dest.exists():
+                    dest.unlink()
+                shutil.move(str(path), str(dest))
+                media_files.append(dest)
+            else:
+                media_files.append(path)
+
+    return sorted(list(set(media_files)), key=lambda p: p.name)
 
 
 def _task_counts(context: ContextTypes.DEFAULT_TYPE) -> dict[int, int]:
@@ -389,25 +409,12 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
 
         await asyncio.sleep(0.5)
 
-        # Fixed: Safely collect files BEFORE moving to prevent rglob iterator corruption
-        files_to_move = [
-            p for p in Path(target_dir).rglob("*")
-            if p.is_file() and p.parent != Path(target_dir)
-        ]
-        for subpath in files_to_move:
-            dest = Path(target_dir) / subpath.name
-            shutil.move(str(subpath), str(dest))
-
-        entries = [
-            p
-            for p in Path(target_dir).iterdir()
-            if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES
-        ]
-        entries.sort(key=lambda p: p.name)
+        # Flatten any nested subfolders created by Instaloader
+        entries = _flatten_target_directory(target_dir)
 
         if not entries:
             raise DownloadError(
-                "No media was downloaded. The account might be private, or the stories expired."
+                "No media was downloaded. The account might be private, or the post/story is unavailable."
             )
 
         await _safe_edit(status_msg, f"Uploading {len(entries)} file(s) to Telegram…")
