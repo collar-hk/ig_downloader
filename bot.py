@@ -31,50 +31,72 @@ MAX_TASKS_PER_USER = 2
 DOWNLOAD_TIMEOUT_SECONDS = 120
 user_active_tasks = defaultdict(int)
 
-# --- 2. Initialize Instaloader & Session Persistence ---
-L = instaloader.Instaloader(
-    filename_pattern="{date_utc:%Y-%m-%d}_{profile}_{typename}_{shortcode}_{mediaid}",
-    download_videos=True,
-    download_video_thumbnails=True,
-    save_metadata=False,
-    compress_json=False,
-)
-
+# --- 2. Initial Login & Session Creation (Runs once on startup) ---
+# We do this once at startup to create/validate the session file.
 if IG_USERNAME:
     SESSION_FILE = f"ig_session_{IG_USERNAME}"
+    L_init = instaloader.Instaloader()
     try:
-        # Try to load existing session to prevent repeated logins (avoids IG bans)
-        L.load_session_from_file(IG_USERNAME, SESSION_FILE)
+        L_init.load_session_from_file(IG_USERNAME, SESSION_FILE)
         logger.info(f"Loaded existing IG session for {IG_USERNAME}")
     except FileNotFoundError:
         if IG_PASSWORD:
             try:
                 logger.info(f"No session found. Logging into Instagram as {IG_USERNAME}...")
-                L.login(IG_USERNAME, IG_PASSWORD)
-                L.save_session_to_file(SESSION_FILE)
+                L_init.login(IG_USERNAME, IG_PASSWORD)
+                L_init.save_session_to_file(SESSION_FILE)
                 logger.info("Successfully logged in and saved session cookie.")
             except Exception as e:
-                logger.error(f"Instagram Login Failed: {e}")
+                logger.error(f"Instagram Login Failed: {e}. Check if IG flagged the account.")
         else:
             logger.warning("IG_USERNAME provided but no IG_PASSWORD. Cannot login.")
 else:
     logger.warning("No IG_USERNAME provided. Story downloads will fail.")
 
 
-# --- Background Download Functions (Synchronous) ---
+# --- Background Download Functions (Thread-Safe) ---
+def get_thread_safe_loader():
+    """Creates a fresh, isolated Instaloader instance for the current background thread."""
+    local_L = instaloader.Instaloader(
+        filename_pattern="{date_utc:%Y-%m-%d}_{profile}_{typename}_{shortcode}_{mediaid}",
+        download_videos=True,
+        download_video_thumbnails=True,
+        save_metadata=False,
+        compress_json=False,
+    )
+    if IG_USERNAME:
+        session_file = f"ig_session_{IG_USERNAME}"
+        if os.path.exists(session_file):
+            local_L.load_session_from_file(IG_USERNAME, session_file)
+    return local_L
+
 def download_post_sync(shortcode, target_dir):
-    post = instaloader.Post.from_shortcode(L.context, shortcode)
-    L.download_post(post, target=target_dir)
+    try:
+        local_L = get_thread_safe_loader()
+        post = instaloader.Post.from_shortcode(local_L.context, shortcode)
+        local_L.download_post(post, target=target_dir)
+    except instaloader.exceptions.ConnectionException:
+        raise Exception("Instagram blocked the connection. The account may require verification.")
 
 def download_story_sync(username, media_id, target_dir):
-    profile = instaloader.Profile.from_username(L.context, username)
-    for story in L.get_stories(userids=[profile.userid]):
-        for item in story.get_items():
-            if media_id and str(item.mediaid) == media_id:
-                L.download_storyitem(item, target=target_dir)
-                return 
-            elif not media_id:
-                L.download_storyitem(item, target=target_dir)
+    try:
+        local_L = get_thread_safe_loader()
+        profile = instaloader.Profile.from_username(local_L.context, username)
+        
+        for story in local_L.get_stories(userids=[profile.userid]):
+            for item in story.get_items():
+                if media_id:
+                    # Target exactly one story
+                    if str(item.mediaid).startswith(media_id):
+                        local_L.download_storyitem(item, target=target_dir)
+                        return 
+                else:
+                    # Download all active stories for the user
+                    local_L.download_storyitem(item, target=target_dir)
+    except instaloader.exceptions.LoginRequiredException:
+        raise Exception("Story downloads require a valid login session, but the session expired or failed.")
+    except instaloader.exceptions.ConnectionException:
+        raise Exception("Instagram blocked the connection. Log into the account manually to clear the warning.")
 
 
 # --- Command Handlers ---
@@ -98,6 +120,7 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
     if "instagram.com" not in text:
         return
 
+    # Extract shortcode/username cleanly, ignoring ?utm tracking garbage
     post_match = re.search(r"/(?:p|reel|tv)/([^/?#&]+)", text)
     story_match = re.search(r"/stories/([^/?#&]+)(?:/([^/?#&]+))?", text)
 
@@ -112,7 +135,6 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
         return
 
     user_active_tasks[user_id] += 1
-    
     unique_id = uuid.uuid4().hex[:8]
     target_dir = f"temp_{unique_id}"
     
@@ -142,6 +164,7 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
                 timeout=DOWNLOAD_TIMEOUT_SECONDS
             )
 
+        # Make sure the folder was created and isn't empty
         if not os.path.exists(target_dir) or not os.listdir(target_dir):
              raise Exception("No media was downloaded. The account might be private, stories expired, or no new content.")
 
@@ -157,14 +180,17 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
                 f = open(file_path, "rb")
                 file_handles.append(f)
                 
+                # Make the filenames human-readable
                 friendly_name = file.replace("GraphImage", "Photo").replace("GraphVideo", "Video").replace("GraphSidecar", "Album").replace("GraphStoryImage", "Story_Photo").replace("GraphStoryVideo", "Story_Video")
                 media_group.append(InputMediaDocument(media=f, filename=friendly_name))
 
+            # Send files in albums of 10 maximum (Telegram limit)
             if media_group:
                 for i in range(0, len(media_group), 10):
                     await context.bot.send_media_group(chat_id=chat_id, media=media_group[i:i + 10])
                     
         finally:
+            # Files must be closed before the OS will let us delete them
             for f in file_handles:
                 f.close()
 
@@ -181,8 +207,9 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
         # --- 3. Memory & File Cleanup ---
         user_active_tasks[user_id] -= 1
         if user_active_tasks[user_id] <= 0:
-            del user_active_tasks[user_id]  # Prevents memory leak over long uptimes
+            del user_active_tasks[user_id] 
         
+        # Safely wipe the temporary folder
         if os.path.exists(target_dir):
             for f in os.listdir(target_dir):
                 try:
@@ -193,6 +220,7 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
                 os.rmdir(target_dir)
             except OSError as e:
                 logger.error(f"Failed to delete directory {target_dir}: {e}")
+
 
 # --- Main Execution ---
 if __name__ == "__main__":
@@ -206,7 +234,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), group_instagram_listener))
     
     logger.info("Bot background service is starting...")
-    
-    # run_polling automatically hooks into OS signals (SIGINT, SIGTERM) 
-    # to shut down gracefully when your server/docker container stops it.
     app.run_polling()
