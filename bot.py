@@ -240,10 +240,18 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
             for item in story.get_items():
                 if not _story_item_matches(item, media_id):
                     continue
-                loader.download_storyitem(item, target=target_dir)
+                loader.download_storyitem(item, target=Path(target_dir))
                 found = True
                 if media_id:
-                    return
+                    break
+            if found and media_id:
+                break
+
+        # Move files out of subfolders to top-level target_dir if Instaloader nested them
+        for subpath in Path(target_dir).rglob("*"):
+            if subpath.is_file() and subpath.parent != Path(target_dir):
+                shutil.move(str(subpath), str(Path(target_dir) / subpath.name))
+
         if not found and media_id:
             raise DownloadError("That story was not found or has expired.")
         if not found:
