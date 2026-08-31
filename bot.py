@@ -210,28 +210,33 @@ def _is_rate_limited(exc: BaseException) -> bool:
 
 
 def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) -> int:
+    username = _normalize_username(username)
+    
+    # 1. Check local cache first
     cached = cache_get(username)
     if cached is not None:
         logger.info("Cache hit for @%s (ID %s)", username, cached)
         return cached
 
-    logger.info("Cache miss for @%s; querying Instagram", username)
+    logger.info("Cache miss for @%s; attempting resolution", username)
+
+    # 2. Try fast HTML scraping first (bypasses GraphQL rate limits)
+    user_id = get_user_id_from_public_html(username)
+    if user_id:
+        cache_set(username, user_id)
+        return user_id
+
+    # 3. Fallback to Instaloader Profile lookup if HTML scraping fails
     try:
+        logger.info("HTML lookup failed for @%s; trying Instaloader API", username)
         profile = instaloader.Profile.from_username(loader.context, username)
         cache_set(username, profile.userid)
         return profile.userid
     except Exception as exc:
-        if not _is_rate_limited(exc):
-            raise DownloadError(f"Could not look up @{username}.") from exc
-
-        logger.warning("API rate-limited for @%s; trying HTML fallback", username)
-        user_id = get_user_id_from_public_html(username)
-        if user_id:
-            cache_set(username, user_id)
-            return user_id
+        logger.error("Failed to resolve user ID for @%s: %s", username, exc)
         raise DownloadError(
-            f"Instagram rate-limited the lookup for @{username}. "
-            f"An admin can run /setid {username} <numeric_id>."
+            f"Could not automatically resolve ID for @{username}. "
+            f"An admin can set it using: /setid {username} <numeric_id>"
         ) from exc
 
 
