@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 import instaloader
 
-# --- 1. Setup Production Logging ---
+# --- Setup Production Logging ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -25,80 +25,65 @@ logger = logging.getLogger(__name__)
 # --- Environment Variables ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 IG_USERNAME = os.environ.get("IG_USERNAME")
-IG_PASSWORD = os.environ.get("IG_PASSWORD")
+PROXY_URL = os.environ.get("PROXY_URL")  # Optional residential proxy URL
 
-# Parse comma-separated Admin Telegram User IDs (e.g., "12345678,98765432")
+# Parse comma-separated Admin Telegram User IDs
 ADMIN_RAW = os.environ.get("ADMIN_TELEGRAM_IDS", "")
 ADMIN_TELEGRAM_IDS = [int(x.strip()) for x in ADMIN_RAW.split(",") if x.strip().isdigit()]
 
-# --- State & Cache Settings ---
+# --- State Settings ---
 MAX_TASKS_PER_USER = 2
 DOWNLOAD_TIMEOUT_SECONDS = 120
 user_active_tasks = defaultdict(int)
 
-# Global ID cache shared across all users to bypass web_profile_info 429 rate limits
+# --- In-Memory Only Cache ---
 USER_ID_CACHE = {}
 
-# --- Initial Login & Session Creation ---
+
+# --- Initial Session Check ---
 if IG_USERNAME:
     SESSION_FILE = f"ig_session_{IG_USERNAME}"
-    L_init = instaloader.Instaloader(max_connection_attempts=1)
-    try:
-        L_init.load_session_from_file(IG_USERNAME, SESSION_FILE)
-        logger.info(f"Loaded existing IG session for {IG_USERNAME}")
-    except FileNotFoundError:
-        if IG_PASSWORD:
-            try:
-                logger.info(f"No session found. Logging into Instagram as {IG_USERNAME}...")
-                L_init.login(IG_USERNAME, IG_PASSWORD)
-                L_init.save_session_to_file(SESSION_FILE)
-                logger.info("Successfully logged in and saved session cookie.")
-            except Exception as e:
-                logger.error(f"Instagram Login Failed: {e}")
-        else:
-            logger.warning("IG_USERNAME provided but no IG_PASSWORD. Cannot login.")
+    session_path = os.path.join(os.getcwd(), SESSION_FILE)
+    if os.path.exists(session_path):
+        logger.info(f"Detected session file at: {session_path}")
+    else:
+        logger.warning(f"Session file missing at {session_path}! Downloads requiring auth may fail.")
 else:
-    logger.warning("No IG_USERNAME provided. Story downloads will fail.")
+    logger.warning("No IG_USERNAME provided in environment variables.")
 
 
-# --- Background Download Functions (Thread-Safe) ---
+# --- Background Download Functions (Thread-Safe & Stealth) ---
 def get_thread_safe_loader():
-    """Creates a fresh, isolated Instaloader instance for the current background thread."""
+    """Creates a fresh, stealthy Instaloader instance for background threads."""
     socket.setdefaulttimeout(15)
     
     local_L = instaloader.Instaloader(
         filename_pattern="{date_utc:%Y-%m-%d}_{profile}_{typename}_{shortcode}_{mediaid}",
         download_videos=True,
-        download_video_thumbnails=True,
+        download_video_thumbnails=True,  # Skip extra HTTP requests for thumbnails
         save_metadata=False,
         compress_json=False,
-        max_connection_attempts=1
+        max_connection_attempts=1,
+        request_timeout=30.0,             # Prevent thread hangs
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
-    
+
+    # Attach proxy if configured
+    if PROXY_URL:
+        local_L.context._session.proxies = {
+            'http': PROXY_URL,
+            'https': PROXY_URL
+        }
+        logger.info("Instaloader session routed via proxy.")
+
+    # Load authenticated session
     if IG_USERNAME:
         session_file = f"ig_session_{IG_USERNAME}"
-        loaded = False
-        
-        # 1. Try loading from saved session file
         if os.path.exists(session_file):
             try:
                 local_L.load_session_from_file(IG_USERNAME, session_file)
-                loaded = True
             except Exception as e:
-                logger.warning(f"Session file invalid or expired: {e}. Attempting fresh login...")
-                try:
-                    os.remove(session_file)
-                except OSError:
-                    pass
-
-        # 2. Fallback: Log in directly using credentials if session fails
-        if not loaded and IG_PASSWORD:
-            try:
-                local_L.login(IG_USERNAME, IG_PASSWORD)
-                local_L.save_session_to_file(session_file)
-                logger.info("Successfully re-authenticated and saved fresh session.")
-            except Exception as e:
-                logger.error(f"Failed to re-authenticate IG user: {e}")
+                logger.error(f"Failed to load session file '{session_file}': {e}")
 
     return local_L
 
@@ -114,15 +99,25 @@ def download_story_sync(username, media_id, target_dir):
     try:
         local_L = get_thread_safe_loader()
         
-        # 1. Check Global Cache first to bypass the web_profile_info endpoint
+        # 1. Check In-Memory Cache first
         if username in USER_ID_CACHE:
             user_id = USER_ID_CACHE[username]
-            logger.info(f"Cache hit for {username} (ID: {user_id}). Bypassing profile API.")
+            logger.info(f"Memory cache hit for {username} (ID: {user_id}). Bypassing profile API.")
         else:
-            logger.info(f"Cache miss for {username}. Fetching from Instagram API...")
-            profile = instaloader.Profile.from_username(local_L.context, username)
-            user_id = profile.userid
-            USER_ID_CACHE[username] = user_id
+            logger.info(f"Memory cache miss for {username}. Querying Instagram API...")
+            try:
+                profile = instaloader.Profile.from_username(local_L.context, username)
+                user_id = profile.userid
+                
+                # Store in memory for runtime duration
+                USER_ID_CACHE[username] = user_id
+            except Exception as e:
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    raise Exception(
+                        f"Instagram rate-limited the profile lookup for @{username} (429).\n"
+                        f"Please use `/setid {username} <numeric_id>` to register this user manually."
+                    )
+                raise e
             
         # 2. Fetch stories directly using numeric User ID
         for story in local_L.get_stories(userids=[user_id]):
@@ -148,10 +143,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ Paste a link. Max 2 concurrent downloads per user allowed.")
 
 async def setid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to manually link a username to a numeric IG User ID."""
+    """Admin command to manually register a username to a numeric IG User ID in memory."""
     user_id = update.effective_user.id
 
-    # Admin Authorization Check
     if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
         await update.message.reply_text("⛔ You are not authorized to use this command.")
         return
@@ -171,10 +165,12 @@ async def setid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ The ID must be numbers only.")
         return
 
+    # Store directly in memory dictionary
     USER_ID_CACHE[username] = target_id
+
     await update.message.reply_text(
-        f"✅ Saved! ID `{target_id}` linked to *@\u200b{username}*.\n"
-        "All story downloads for this user will now bypass Instagram profile lookups.",
+        f"✅ Saved in memory! ID `{target_id}` linked to *@\u200b{username}*.\n"
+        "Story downloads for this user will now bypass Instagram profile lookups while the bot is active.",
         parse_mode="Markdown"
     )
 
@@ -292,7 +288,6 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("setid", setid_command))
