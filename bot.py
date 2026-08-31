@@ -456,6 +456,7 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
                 await context.bot.send_media_group(
                     chat_id=chat_id,
                     media=media_group[i : i + TELEGRAM_MEDIA_GROUP_LIMIT],
+                    reply_to_message_id=message.message_id,  # Keeps it as a direct reply
                 )
 
         await status_msg.delete()
