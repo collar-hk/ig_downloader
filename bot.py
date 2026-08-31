@@ -385,7 +385,7 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
 
         entries = [
             p
-            for p in Path(target_dir).iterdir()
+            for p in Path(target_dir).rglob("*")
             if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES
         ]
         entries.sort(key=lambda p: p.name)
