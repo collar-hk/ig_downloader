@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Instagram downloader Telegram bot (optimized from gemini-code-1788158550506.py)."""
+"""Instagram downloader Telegram bot."""
 
 from __future__ import annotations
 
@@ -155,7 +155,8 @@ def get_thread_safe_loader() -> instaloader.Instaloader:
         max_connection_attempts=1,
         request_timeout=30.0,
         user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
     )
     if IG_USERNAME and SESSION_FILE and SESSION_FILE.exists():
@@ -246,11 +247,6 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
                     break
             if found and media_id:
                 break
-
-        # Move files out of subfolders to top-level target_dir if Instaloader nested them
-        for subpath in Path(target_dir).rglob("*"):
-            if subpath.is_file() and subpath.parent != Path(target_dir):
-                shutil.move(str(subpath), str(Path(target_dir) / subpath.name))
 
         if not found and media_id:
             raise DownloadError("That story was not found or has expired.")
@@ -390,12 +386,21 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
                 )
 
+        # Brief delay to allow background thread file writes to complete
+        await asyncio.sleep(0.5)
+
+        # Move files out of subfolders to root target_dir if Instaloader nested them
+        for subpath in Path(target_dir).rglob("*"):
+            if subpath.is_file() and subpath.parent != Path(target_dir):
+                shutil.move(str(subpath), str(Path(target_dir) / subpath.name))
+
         entries = [
             p
-            for p in Path(target_dir).rglob("*")
+            for p in Path(target_dir).iterdir()
             if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES
         ]
         entries.sort(key=lambda p: p.name)
+
         if not entries:
             raise DownloadError(
                 "No media was downloaded. The account might be private, or the stories expired."
