@@ -155,7 +155,7 @@ def get_thread_safe_loader() -> instaloader.Instaloader:
         max_connection_attempts=1,
         request_timeout=30.0,
         user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:154.0) Gecko/20100101 Firefox/154.0"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
         ),
     )
     if IG_USERNAME and SESSION_FILE and SESSION_FILE.exists():
