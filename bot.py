@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 import instaloader
 
-# --- Setup Production Logging ---
+# --- 1. Setup Production Logging ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -27,16 +27,21 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 IG_USERNAME = os.environ.get("IG_USERNAME")
 IG_PASSWORD = os.environ.get("IG_PASSWORD")
 
+# Parse comma-separated Admin Telegram User IDs (e.g., "12345678,98765432")
+ADMIN_RAW = os.environ.get("ADMIN_TELEGRAM_IDS", "")
+ADMIN_TELEGRAM_IDS = [int(x.strip()) for x in ADMIN_RAW.split(",") if x.strip().isdigit()]
+
 # --- State & Cache Settings ---
 MAX_TASKS_PER_USER = 2
 DOWNLOAD_TIMEOUT_SECONDS = 120
 user_active_tasks = defaultdict(int)
-USER_ID_CACHE = {}  # Caches numeric User IDs to bypass 429 rate limits on web_profile_info
+
+# Global ID cache shared across all users to bypass web_profile_info 429 rate limits
+USER_ID_CACHE = {}
 
 # --- Initial Login & Session Creation ---
 if IG_USERNAME:
     SESSION_FILE = f"ig_session_{IG_USERNAME}"
-    # max_connection_attempts=1 prevents infinite sleep loops on HTTP 429 Too Many Requests
     L_init = instaloader.Instaloader(max_connection_attempts=1)
     try:
         L_init.load_session_from_file(IG_USERNAME, SESSION_FILE)
@@ -67,7 +72,7 @@ def get_thread_safe_loader():
         download_video_thumbnails=True,
         save_metadata=False,
         compress_json=False,
-        max_connection_attempts=1  # Crucial for preventing silent rate-limit freezes
+        max_connection_attempts=1
     )
     if IG_USERNAME:
         session_file = f"ig_session_{IG_USERNAME}"
@@ -87,7 +92,7 @@ def download_story_sync(username, media_id, target_dir):
     try:
         local_L = get_thread_safe_loader()
         
-        # 1. Check Cache to bypass the protected web_profile_info endpoint
+        # 1. Check Global Cache first to bypass the web_profile_info endpoint
         if username in USER_ID_CACHE:
             user_id = USER_ID_CACHE[username]
             logger.info(f"Cache hit for {username} (ID: {user_id}). Bypassing profile API.")
@@ -97,7 +102,7 @@ def download_story_sync(username, media_id, target_dir):
             user_id = profile.userid
             USER_ID_CACHE[username] = user_id
             
-        # 2. Fetch stories directly using the numeric User ID
+        # 2. Fetch stories directly using numeric User ID
         for story in local_L.get_stories(userids=[user_id]):
             for item in story.get_items():
                 if media_id:
@@ -119,6 +124,37 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("ℹ️ Paste a link. Max 2 concurrent downloads per user allowed.")
+
+async def setid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to manually link a username to a numeric IG User ID."""
+    user_id = update.effective_user.id
+
+    # Admin Authorization Check
+    if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        return
+
+    if not context.args or len(context.args) != 2:
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/setid [username] [numeric_id]`\n"
+            "Example: `/setid ivyysooo 5857218683`",
+            parse_mode="Markdown"
+        )
+        return
+
+    username = context.args[0].lower().strip().replace("@", "")
+    try:
+        target_id = int(context.args[1].strip())
+    except ValueError:
+        await update.message.reply_text("❌ The ID must be numbers only.")
+        return
+
+    USER_ID_CACHE[username] = target_id
+    await update.message.reply_text(
+        f"✅ Saved! ID `{target_id}` linked to *@\u200b{username}*.\n"
+        "All story downloads for this user will now bypass Instagram profile lookups.",
+        parse_mode="Markdown"
+    )
 
 
 # --- Main Listener ---
@@ -233,8 +269,11 @@ if __name__ == "__main__":
         exit(1)
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("setid", setid_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), group_instagram_listener))
     
     logger.info("Bot background service is starting...")
