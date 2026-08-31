@@ -111,7 +111,7 @@ def cache_set(username: str, user_id: int) -> None:
 
 
 def get_user_id_from_public_html(username: str) -> int | None:
-    """Last-resort profile_id scrape when Instaloader hits HTTP 429."""
+    """Enhanced profile_id scrape supporting authenticated cookies & expanded regex patterns."""
     url = f"https://www.instagram.com/{username}/"
     headers = {
         "User-Agent": (
@@ -119,26 +119,48 @@ def get_user_id_from_public_html(username: str) -> int | None:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Mode": "navigate",
     }
+    
+    # Attach session cookie if available to bypass the login redirect
+    if IG_USERNAME and SESSION_FILE and SESSION_FILE.exists():
+        try:
+            loader = get_thread_safe_loader()
+            session_cookies = loader.context._session.cookies
+            cookie_str = "; ".join([f"{c.name}={c.value}" for c in session_cookies])
+            headers["Cookie"] = cookie_str
+        except Exception as err:
+            logger.debug("Could not attach session cookies to HTML request: %s", err)
+
     req = Request(url, headers=headers)
     try:
-        with urlopen(req, timeout=10) as response:
+        with urlopen(req, timeout=12) as response:
             html = response.read().decode("utf-8", errors="replace")
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        logger.warning("HTML fallback failed for @%s: %s", username, exc)
+        logger.warning("HTML fallback request failed for @%s: %s", username, exc)
         return None
 
-    match = (
-        re.search(r'"profile_id":"(\d+)"', html)
-        or re.search(r'"container_id":"(\d+)"', html)
-        or re.search(r'"user_id":"(\d+)"', html)
-        or re.search(r"profilePage_(\d+)", html)
-    )
-    if not match:
-        return None
-    extracted_id = int(match.group(1))
-    logger.info("Scraped user ID %s for @%s from HTML", extracted_id, username)
-    return extracted_id
+    # Expanded regex matching escaped quotes, meta tags, and alternate JSON fields
+    patterns = [
+        r'\\"profile_id\\":\\"(\d+)\\"',
+        r'"profile_id":"(\d+)"',
+        r'"container_id":"(\d+)"',
+        r'"user_id":"(\d+)"',
+        r'profilePage_(\d+)',
+        r'instagram://user\?username=[^"]+?&id=(\d+)',
+        r'"owner":\{"id":"(\d+)"',
+        r'"id":"(\d+)","username":"' + re.escape(username) + r'"',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            extracted_id = int(match.group(1))
+            logger.info("Successfully scraped user ID %s for @%s from HTML", extracted_id, username)
+            return extracted_id
+
+    logger.warning("HTML fallback fetched page for @%s, but no valid profile ID pattern matched.", username)
+    return None
 
 
 def get_thread_safe_loader() -> instaloader.Instaloader:
