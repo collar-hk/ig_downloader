@@ -149,11 +149,11 @@ def get_thread_safe_loader() -> instaloader.Instaloader:
     loader = instaloader.Instaloader(
         filename_pattern="{date_utc:%Y-%m-%d}_{profile}_{typename}_{mediaid}",
         download_videos=True,
-        download_video_thumbnails=False,
+        download_video_thumbnails=True,
         save_metadata=False,
         compress_json=False,
-        max_connection_attempts=1,
-        request_timeout=30.0,
+        max_connection_attempts=2,
+        request_timeout=60.0,
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -263,10 +263,8 @@ def _flatten_target_directory(target_dir: str) -> list[Path]:
     target_path = Path(target_dir)
     media_files: list[Path] = []
 
-    # Find all media files recursively
     for path in list(target_path.rglob("*")):
         if path.is_file() and path.suffix.lower() in MEDIA_SUFFIXES:
-            # If the file is inside a subfolder (e.g., target_dir/username/file.mp4), move it out
             if path.parent != target_path:
                 dest = target_path / path.name
                 if dest.exists():
@@ -426,11 +424,11 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
                 media_group.append(
                     InputMediaDocument(media=handle, filename=_friendly_filename(path.name))
                 )
+            # Group files into combined media galleries sent to the chat
             for i in range(0, len(media_group), TELEGRAM_MEDIA_GROUP_LIMIT):
                 await context.bot.send_media_group(
                     chat_id=chat_id,
                     media=media_group[i : i + TELEGRAM_MEDIA_GROUP_LIMIT],
-                    reply_to_message_id=message.message_id,
                 )
 
         await status_msg.delete()
