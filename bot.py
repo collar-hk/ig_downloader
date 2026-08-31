@@ -74,10 +74,32 @@ def get_thread_safe_loader():
         compress_json=False,
         max_connection_attempts=1
     )
+    
     if IG_USERNAME:
         session_file = f"ig_session_{IG_USERNAME}"
+        loaded = False
+        
+        # 1. Try loading from saved session file
         if os.path.exists(session_file):
-            local_L.load_session_from_file(IG_USERNAME, session_file)
+            try:
+                local_L.load_session_from_file(IG_USERNAME, session_file)
+                loaded = True
+            except Exception as e:
+                logger.warning(f"Session file invalid or expired: {e}. Attempting fresh login...")
+                try:
+                    os.remove(session_file)
+                except OSError:
+                    pass
+
+        # 2. Fallback: Log in directly using credentials if session fails
+        if not loaded and IG_PASSWORD:
+            try:
+                local_L.login(IG_USERNAME, IG_PASSWORD)
+                local_L.save_session_to_file(session_file)
+                logger.info("Successfully re-authenticated and saved fresh session.")
+            except Exception as e:
+                logger.error(f"Failed to re-authenticate IG user: {e}")
+
     return local_L
 
 def download_post_sync(shortcode, target_dir):
