@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Instagram downloader Telegram bot with multi-session rotation."""
+"""Instagram & YouTube downloader Telegram bot with multi-session rotation."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import instaloader
+import yt_dlp
 from telegram import InputMediaDocument, Update
 from telegram.ext import (
     Application,
@@ -42,15 +43,22 @@ ADMIN_TELEGRAM_IDS = {int(x.strip()) for x in ADMIN_RAW.split(",") if x.strip().
 
 MAX_TASKS_PER_USER = 2
 MAX_GLOBAL_DOWNLOADS = 5
-DOWNLOAD_TIMEOUT_SECONDS = 120
+DOWNLOAD_TIMEOUT_SECONDS = 300  # Increased timeout for larger YouTube video processing
 TELEGRAM_MEDIA_GROUP_LIMIT = 10
-MEDIA_SUFFIXES = {".mp4", ".jpg", ".jpeg", ".png", ".webp"}
+MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png", ".webp"}
 
 CACHE_PATH = Path(os.environ.get("USER_ID_CACHE_PATH", "user_id_cache.json"))
 
+# Match Instagram URLs
 INSTAGRAM_HOST_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am)/", re.I)
 POST_RE = re.compile(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", re.I)
 STORY_RE = re.compile(r"/stories/([^/?#&]+)(?:/([^/?#&]+))?", re.I)
+
+# Match YouTube URLs
+YOUTUBE_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})",
+    re.I,
+)
 
 _cache_lock = threading.Lock()
 _user_id_cache: dict[str, int] = {}
@@ -144,7 +152,7 @@ def get_user_id_from_public_html(username: str) -> int | None:
         "Accept-Language": "en-US,en;q=0.9",
         "Sec-Fetch-Mode": "navigate",
     }
-    
+
     loader, _ = get_thread_safe_loader()
     if loader and loader.context._session.cookies:
         try:
@@ -235,7 +243,7 @@ def _friendly_filename(name: str) -> str:
 
 def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) -> int:
     username = _normalize_username(username)
-    
+
     cached = cache_get(username)
     if cached is not None:
         logger.info("Cache hit for @%s (ID %s)", username, cached)
@@ -315,9 +323,36 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
         except DownloadError:
             raise
         except Exception as exc:
-            logger.warning("Attempt %s failed for story @%s with session '%s': %s", attempt + 1, username, current_user, exc)
+            logger.warning(
+                "Attempt %s failed for story @%s with session '%s': %s",
+                attempt + 1,
+                username,
+                current_user,
+                exc,
+            )
             if attempt == attempts - 1:
                 raise DownloadError(f"Failed to fetch that story: {exc}") from exc
+
+
+def download_youtube_sync(url: str, target_dir: str) -> None:
+    """Download best video and audio using yt-dlp and auto-merge via ffmpeg."""
+    ydl_opts = {
+        # Downloads highest quality video + highest quality audio and merges them into mp4
+        "format": "bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        # Restrict filenames to avoid weird special characters in pathing
+        "restrictfilenames": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        logger.error("yt-dlp download failed for %s: %s", url, exc)
+        raise DownloadError(f"Failed to download YouTube video: {exc}") from exc
 
 
 def _flatten_target_directory(target_dir: str) -> list[Path]:
@@ -368,8 +403,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.message:
         return
     await update.message.reply_text(
-        "Welcome to the IG Downloader Bot.\n\n"
-        "Send an Instagram post, reel, IGTV, or story link.",
+        "Welcome to the Media Downloader Bot.\n\n"
+        "Send an Instagram link (post, reel, story, IGTV) or YouTube link.",
     )
 
 
@@ -377,7 +412,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message:
         return
     await update.message.reply_text(
-        f"Paste a link. Max {MAX_TASKS_PER_USER} concurrent downloads per user."
+        f"Paste an Instagram or YouTube link. Max {MAX_TASKS_PER_USER} concurrent downloads per user."
     )
 
 
@@ -412,18 +447,25 @@ def _safe_edit(status_msg: Any, text: str):
     return status_msg.edit_text(text)
 
 
-async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not message.text:
         return
 
     text = message.text
-    if not INSTAGRAM_HOST_RE.search(text):
+
+    # Route request based on matchers
+    is_instagram = INSTAGRAM_HOST_RE.search(text)
+    is_youtube = YOUTUBE_RE.search(text)
+
+    if not is_instagram and not is_youtube:
         return
 
-    post_match = POST_RE.search(text)
-    story_match = STORY_RE.search(text)
-    if not post_match and not story_match:
+    post_match = POST_RE.search(text) if is_instagram else None
+    story_match = STORY_RE.search(text) if is_instagram else None
+
+    # If it matched instagram host but not a supported post/story structure, ignore
+    if is_instagram and not post_match and not story_match:
         return
 
     user = message.from_user
@@ -436,7 +478,7 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
         await message.reply_text("You have too many active downloads. Please wait for them to finish.")
         return
 
-    target_dir = tempfile.mkdtemp(prefix=f"ig_{uuid.uuid4().hex[:8]}_")
+    target_dir = tempfile.mkdtemp(prefix=f"dl_{uuid.uuid4().hex[:8]}_")
     status_msg = await message.reply_text("Fetching… this may take a moment.")
     logger.info("User %s requested download into %s", user_id, target_dir)
 
@@ -445,7 +487,14 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
 
     try:
         async with sema:
-            if post_match:
+            if is_youtube:
+                yt_url = is_youtube.group(0)
+                await _safe_edit(status_msg, "Downloading YouTube video in highest quality...")
+                await asyncio.wait_for(
+                    asyncio.to_thread(download_youtube_sync, yt_url, target_dir),
+                    timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                )
+            elif post_match:
                 shortcode = post_match.group(1)
                 await asyncio.wait_for(
                     asyncio.to_thread(download_post_sync, shortcode, target_dir),
@@ -472,7 +521,7 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
 
         if not entries:
             raise DownloadError(
-                "No media was downloaded. The account might be private, or the post/story is unavailable."
+                "No media was downloaded. The resource might be unavailable or private."
             )
 
         await _safe_edit(status_msg, f"Uploading {len(entries)} file(s) to Telegram…")
@@ -487,7 +536,7 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
             for i in range(0, len(media_group), TELEGRAM_MEDIA_GROUP_LIMIT):
                 await context.bot.send_media_group(
                     chat_id=chat_id,
-                    media=media_group[i : i + TELEGRAM_MEDIA_GROUP_LIMIT]
+                    media=media_group[i : i + TELEGRAM_MEDIA_GROUP_LIMIT],
                 )
 
         await status_msg.delete()
@@ -495,7 +544,7 @@ async def group_instagram_listener(update: Update, context: ContextTypes.DEFAULT
 
     except asyncio.TimeoutError:
         logger.warning("Timeout for user %s in %s", user_id, target_dir)
-        await _safe_edit(status_msg, "Download timed out. Instagram took too long to respond.")
+        await _safe_edit(status_msg, "Download timed out. The request took too long to complete.")
     except DownloadError as exc:
         logger.error("Download error for user %s: %s", user_id, exc)
         await _safe_edit(status_msg, f"Error: {exc}")
@@ -512,10 +561,10 @@ async def _post_init(application: Application) -> None:
     _global_download_sema = asyncio.Semaphore(MAX_GLOBAL_DOWNLOADS)
     _slot_lock = asyncio.Lock()
     load_user_id_cache()
-    
+
     sessions = get_available_session_files()
     logger.info("Detected %d session file(s): %s", len(sessions), [s.name for s in sessions])
-    
+
     if not ADMIN_TELEGRAM_IDS:
         logger.warning("ADMIN_TELEGRAM_IDS is empty; /setid is disabled for everyone.")
     logger.info("Bot is ready.")
@@ -537,7 +586,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("setid", setid_command))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), group_instagram_listener))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), media_listener))
 
     logger.info("Bot background service is starting…")
     app.run_polling(drop_pending_updates=True)
