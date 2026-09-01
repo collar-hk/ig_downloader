@@ -341,6 +341,7 @@ def download_youtube_sync(url: str, target_dir: str) -> None:
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
+        "cookiefile": "cookies-youtube-com.txt",
         "quiet": True,
         "no_warnings": True,
         # Restrict filenames to avoid weird special characters in pathing
