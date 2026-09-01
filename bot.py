@@ -335,18 +335,27 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
 
 
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download best video and audio using yt-dlp and auto-merge via ffmpeg."""
+    """Download best video and audio using yt-dlp with cookie file and alternate clients."""
+    cookie_path = Path("youtube_cookies.txt")
+    
     ydl_opts = {
-        # Downloads highest quality video + highest quality audio and merges them into mp4
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
-        "cookiefile": "cookies-youtube-com.txt",
         "quiet": True,
         "no_warnings": True,
-        # Restrict filenames to avoid weird special characters in pathing
         "restrictfilenames": True,
+        # 1. Rotate clients away from 'web' to avoid the reload error
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "android", "tv_embedded", "mweb"]
+            }
+        },
     }
+
+    # 2. Attach cookiefile if present on disk
+    if cookie_path.exists():
+        ydl_opts["cookiefile"] = str(cookie_path)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
