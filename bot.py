@@ -335,25 +335,32 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
 
 
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download best video and audio using yt-dlp with cookie file and alternate clients."""
+    """Download YouTube video in highest resolution (VP9 > AV1 preference) and recode to MP4."""
     cookie_path = Path("youtube_cookies.txt")
-    
+
     ydl_opts = {
-        "format": "bestvideo+bestaudio/best",
+        # Select highest quality video prioritizing VP9, then AV01, then best available
+        "format": "bestvideo[vcodec^=vp9]+bestaudio/bestvideo[vcodec^=av01]+bestaudio/bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
-        # 1. Rotate clients away from 'web' to avoid the reload error
+        # Rotate clients away from standard web player to avoid "page needs to be reloaded"
         "extractor_args": {
             "youtube": {
                 "player_client": ["ios", "android", "tv_embedded", "mweb"]
             }
         },
+        # Equivalent to yt-dlp --recode mp4
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }
+        ],
     }
 
-    # 2. Attach cookiefile if present on disk
     if cookie_path.exists():
         ydl_opts["cookiefile"] = str(cookie_path)
 
