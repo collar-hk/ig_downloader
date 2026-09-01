@@ -1,3 +1,4 @@
+yt-dlp>=2024.08.06
+yt-dlp-get-pot
 python-telegram-bot
 instaloader
-yt_dlp
