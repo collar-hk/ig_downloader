@@ -335,30 +335,33 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
 
 
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download YouTube video in highest resolution (VP9 > AV1 preference) and recode to MP4."""
+    """Download YouTube video in highest resolution and encode to mobile-compatible MP4 (H.264 + AAC)."""
     cookie_path = Path("youtube_cookies.txt")
 
     ydl_opts = {
-        # Select highest quality video prioritizing VP9, then AV01, then best available
-        "format": "bestvideo[vcodec^=vp9]+bestaudio/bestvideo[vcodec^=av01]+bestaudio/bestvideo+bestaudio/best",
+        # 1. Always select the absolute best video and audio streams regardless of original codec
+        "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
-        # Rotate clients away from standard web player to avoid "page needs to be reloaded"
         "extractor_args": {
             "youtube": {
                 "player_client": ["ios", "android", "tv_embedded", "mweb"]
             }
         },
-        # Equivalent to yt-dlp --recode mp4
-        "postprocessors": [
-            {
-                "key": "FFmpegVideoConvertor",
-                "preferedformat": "mp4",
-            }
-        ],
+        # 2. Force FFmpeg to encode to H.264 (AVC) & AAC inside an MP4 container for universal mobile playback
+        "postprocessor_args": {
+            "ffmpeg": [
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "22",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+            ]
+        },
     }
 
     if cookie_path.exists():
