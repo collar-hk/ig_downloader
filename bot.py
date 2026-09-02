@@ -347,39 +347,29 @@ def clean_youtube_url(url: str) -> str:
 
 
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download highest resolution video (313+140 priority) and convert to mobile-compatible MP4."""
+    """Download YouTube video in highest quality while bypassing PO Token challenges."""
     cookie_path = Path("cookies-youtube-com.txt")
     cleaned_url = clean_youtube_url(url)
 
     ydl_opts = {
-        # Priority: Exact 4K VP9 (313) + AAC audio (140), falling back to best video + audio
-        "format": "313+140/bv*+140/bv*+ba/best",
+        # Select best available video + audio, falling back to pre-merged single format (/b or /best)
+        "format": "bv*+ba/b/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
         "noplaylist": True,
-        # Configure JavaScript runtimes as a dict
-        "js_runtimes": {
-            "node": {},
-            "deno": {},
+        # Rotate through client endpoints that bypass "page needs to be reloaded" JS checks
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "tv_embedded", "mweb"]
+            }
         },
-        # Force FFmpeg re-encoding to libx264 + AAC inside an MP4 container
+        # Faststart metadata flag for mobile preview streaming
         "postprocessor_args": {
             "ffmpeg": [
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-crf",
-                "20",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-movflags",
-                "+faststart",
+                "-movflags", "+faststart",
             ]
         },
     }
