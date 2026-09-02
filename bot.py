@@ -335,29 +335,23 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
 
 
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download YouTube video in absolute highest quality and convert to mobile MP4."""
-    cookie_path = Path("youtube_cookies.txt")
+    """Download YouTube video in highest available quality and re-encode to mobile MP4."""
+    cookie_path = Path("cookies-youtube-com.txt")
 
     ydl_opts = {
-        # Select best available video and audio streams
-        "format": "bv*+ba/b",
+        # Select best video + best audio, falling back to best single format if separate streams fail
+        "format": "bv*+ba/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
-        # Allow default web client to access unthrottled 1080p/4K formats
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "mweb", "android"]
-            }
-        },
-        # Fast encoding to H.264 + AAC so mobile devices and Telegram can stream it smoothly
+        # Force FFmpeg re-encoding to H.264 + AAC for mobile playback
         "postprocessor_args": {
             "ffmpeg": [
                 "-c:v", "libx264",
-                "-preset", "superfast",  # Keeps encoding process quick for Telegram
-                "-crf", "20",            # Lower CRF = higher visual quality (18-22 is standard)
+                "-preset", "superfast",
+                "-crf", "20",
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-movflags", "+faststart",
@@ -366,14 +360,14 @@ def download_youtube_sync(url: str, target_dir: str) -> None:
     }
 
     if cookie_path.exists():
-        ydl_opts["cookiefile"] = str(cookie_path)
+        ydl_opts["cookiefile"] = str(cookie_path)[cite: 1]
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            ydl.download([url])[cite: 1]
     except Exception as exc:
-        logger.error("yt-dlp download failed for %s: %s", url, exc)
-        raise DownloadError(f"Failed to download YouTube video: {exc}") from exc
+        logger.error("yt-dlp download failed for %s: %s", url, exc)[cite: 1]
+        raise DownloadError(f"Failed to download YouTube video: {exc}") from exc[cite: 1]
 
 
 def _flatten_target_directory(target_dir: str) -> list[Path]:
