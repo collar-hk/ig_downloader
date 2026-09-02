@@ -347,35 +347,39 @@ def clean_youtube_url(url: str) -> str:
 
 
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download YouTube video in highest quality bypassing PO Token challenges."""
-    cookie_path = Path("cookies-youtube-com.txt")
+    """Download YouTube video in maximum 4K quality using iOS/Android clients (unauthenticated)."""
     cleaned_url = clean_youtube_url(url)
 
     ydl_opts = {
-        # Select best available video + audio, falling back to pre-merged single format (/b or /best)
-        "format": "bv*+ba/b/best",
+        # 'bv*+ba/best' requests highest available resolution (4K 2160p / 1080p 60fps)
+        "format": "bv*+ba/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
         "noplaylist": True,
-        # Force mobile/TV client endpoints to bypass "The page needs to be reloaded" JS checks
+        # iOS and Android clients serve unthrottled 4K streams without triggering PO Token reload errors
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "tv_embedded", "mweb"]
+                "player_client": ["ios", "android"]
             }
         },
-        # Move metadata atom to start for fast preview streaming
+        # Re-encode to H.264 + AAC so mobile devices and Telegram can stream the 4K MP4 file
         "postprocessor_args": {
             "ffmpeg": [
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "20",
+                "-c:a", "aac",
+                "-b:a", "192k",
                 "-movflags", "+faststart",
             ]
         },
     }
 
-    if cookie_path.exists():
-        ydl_opts["cookiefile"] = str(cookie_path)
+    # NOTE: We do NOT load cookie_path for YouTube here.
+    # Passing web cookies causes yt-dlp to skip iOS/Android endpoints, dropping resolution down to 720p.
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
