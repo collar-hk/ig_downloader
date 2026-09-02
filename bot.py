@@ -17,6 +17,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 import instaloader
@@ -43,7 +44,7 @@ ADMIN_TELEGRAM_IDS = {int(x.strip()) for x in ADMIN_RAW.split(",") if x.strip().
 
 MAX_TASKS_PER_USER = 2
 MAX_GLOBAL_DOWNLOADS = 5
-DOWNLOAD_TIMEOUT_SECONDS = 300  # Increased timeout for larger YouTube video processing
+DOWNLOAD_TIMEOUT_SECONDS = 600  # Extended timeout for 4K video downloads and re-encoding
 TELEGRAM_MEDIA_GROUP_LIMIT = 10
 MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png", ".webp"}
 
@@ -334,40 +335,60 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
                 raise DownloadError(f"Failed to fetch that story: {exc}") from exc
 
 
+def clean_youtube_url(url: str) -> str:
+    """Strip playlist and extra parameters, keeping only the 'v' video ID parameter."""
+    parsed = urlparse(url)
+    if "youtube.com" in parsed.netloc:
+        query = parse_qs(parsed.query)
+        video_id = query.get("v")
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id[0]}"
+    return url
+
+
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download YouTube video in highest available quality and re-encode to mobile MP4."""
+    """Download highest resolution video (313+140 priority) and convert to mobile-compatible MP4."""
     cookie_path = Path("cookies-youtube-com.txt")
+    cleaned_url = clean_youtube_url(url)
 
     ydl_opts = {
-        # Select best video + best audio, falling back to best single format if separate streams fail
-        "format": "bv*+ba/best",
+        # Priority: Exact 4K VP9 (313) + AAC audio (140), falling back to best video + audio
+        "format": "313+140/bv*+140/bv*+ba/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
-        # Force FFmpeg re-encoding to H.264 + AAC for mobile playback
+        "noplaylist": True,
+        "js_runtimes": ["node", "deno"],
+        # Force FFmpeg re-encoding to libx264 + AAC inside an MP4 container
         "postprocessor_args": {
             "ffmpeg": [
-                "-c:v", "libx264",
-                "-preset", "superfast",
-                "-crf", "20",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-movflags", "+faststart",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "20",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
             ]
         },
     }
 
     if cookie_path.exists():
-        ydl_opts["cookiefile"] = str(cookie_path)[cite: 1]
+        ydl_opts["cookiefile"] = str(cookie_path)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])[cite: 1]
+            ydl.download([cleaned_url])
     except Exception as exc:
-        logger.error("yt-dlp download failed for %s: %s", url, exc)[cite: 1]
-        raise DownloadError(f"Failed to download YouTube video: {exc}") from exc[cite: 1]
+        logger.error("yt-dlp download failed for %s: %s", cleaned_url, exc)
+        raise DownloadError(f"Failed to download YouTube video: {exc}") from exc
 
 
 def _flatten_target_directory(target_dir: str) -> list[Path]:
