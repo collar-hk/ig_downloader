@@ -360,7 +360,11 @@ def download_youtube_sync(url: str, target_dir: str) -> None:
         "no_warnings": True,
         "restrictfilenames": True,
         "noplaylist": True,
-        "js_runtimes": ["node", "deno"],
+        # Configure JavaScript runtimes as a dict
+        "js_runtimes": {
+            "node": {},
+            "deno": {},
+        },
         # Force FFmpeg re-encoding to libx264 + AAC inside an MP4 container
         "postprocessor_args": {
             "ffmpeg": [
