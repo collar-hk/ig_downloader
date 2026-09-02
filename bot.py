@@ -335,28 +335,29 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
 
 
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download YouTube video in highest resolution and encode to mobile-compatible MP4 (H.264 + AAC)."""
+    """Download YouTube video in absolute highest quality and convert to mobile MP4."""
     cookie_path = Path("youtube_cookies.txt")
 
     ydl_opts = {
-        # 1. Always select the absolute best video and audio streams regardless of original codec
-        "format": "bestvideo+bestaudio/best",
+        # Select best available video and audio streams
+        "format": "bv*+ba/b",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
+        # Allow default web client to access unthrottled 1080p/4K formats
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "android", "tv_embedded", "mweb"]
+                "player_client": ["web", "mweb", "android"]
             }
         },
-        # 2. Force FFmpeg to encode to H.264 (AVC) & AAC inside an MP4 container for universal mobile playback
+        # Fast encoding to H.264 + AAC so mobile devices and Telegram can stream it smoothly
         "postprocessor_args": {
             "ffmpeg": [
                 "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "22",
+                "-preset", "superfast",  # Keeps encoding process quick for Telegram
+                "-crf", "20",            # Lower CRF = higher visual quality (18-22 is standard)
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-movflags", "+faststart",
