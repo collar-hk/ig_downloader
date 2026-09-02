@@ -347,7 +347,7 @@ def clean_youtube_url(url: str) -> str:
 
 
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download YouTube video in highest quality while bypassing PO Token challenges."""
+    """Download YouTube video in highest quality bypassing PO Token challenges."""
     cookie_path = Path("cookies-youtube-com.txt")
     cleaned_url = clean_youtube_url(url)
 
@@ -360,13 +360,13 @@ def download_youtube_sync(url: str, target_dir: str) -> None:
         "no_warnings": True,
         "restrictfilenames": True,
         "noplaylist": True,
-        # Rotate through client endpoints that bypass "page needs to be reloaded" JS checks
+        # Force mobile/TV client endpoints to bypass "The page needs to be reloaded" JS checks
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios", "tv_embedded", "mweb"]
             }
         },
-        # Faststart metadata flag for mobile preview streaming
+        # Move metadata atom to start for fast preview streaming
         "postprocessor_args": {
             "ffmpeg": [
                 "-movflags", "+faststart",
