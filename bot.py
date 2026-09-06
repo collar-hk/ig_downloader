@@ -570,9 +570,13 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 caption = None
                 if i == len(entries) - 1 and is_instagram:
                     parts = path.name.split('_')
-                    if len(parts) >= 3 and parts[0].count('-') == 2:
+                    # Ensure it has enough parts to safely extract date, user, type, and ID
+                    if len(parts) >= 4 and parts[0].count('-') == 2:
                         date_str = parts[0].replace('-', '')
-                        ig_user = parts[1]
+                        
+                        # Reconstruct usernames that contain underscores (e.g., 6y_day)
+                        # Everything between the date (index 0) and the typename (index -2) is the username
+                        ig_user = "_".join(parts[1:-2])
                         
                         if story_match:
                             ig_type = "IGS"
