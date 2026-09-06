@@ -76,6 +76,15 @@ class DownloadError(Exception):
     """User-facing download failure."""
 
 
+def log_failed_account(account_name: str, error_msg: str):
+    """Appends failed target accounts or sessions to a dedicated log file."""
+    try:
+        with open("failed_accounts.log", "a", encoding="utf-8") as f:
+            f.write(f"Failed Account: {account_name} | Error: {error_msg}\n")
+    except IOError as e:
+        logger.error("Could not write to failed_accounts.log: %s", e)
+
+
 def _normalize_username(username: str) -> str:
     return username.strip().lstrip("@").lower()
 
@@ -96,7 +105,6 @@ def get_next_session_file() -> tuple[str, Path] | tuple[None, None]:
         selected_file = session_files[_session_index % len(session_files)]
         _session_index = (_session_index + 1) % len(session_files)
 
-    # File format is expected to be `ig_session_username`
     username = selected_file.name.replace("ig_session_", "")
     return username, selected_file
 
@@ -285,6 +293,7 @@ def download_post_sync(shortcode: str, target_dir: str) -> None:
         except Exception as exc:
             logger.warning("Attempt %s failed with session '%s': %s", attempt + 1, current_user, exc)
             if attempt == attempts - 1:
+                log_failed_account(f"post_{shortcode}", str(exc))
                 raise DownloadError(f"Failed to fetch that post or reel: {exc}") from exc
 
 
@@ -332,6 +341,7 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
                 exc,
             )
             if attempt == attempts - 1:
+                log_failed_account(username, str(exc))
                 raise DownloadError(f"Failed to fetch that story: {exc}") from exc
 
 
@@ -351,7 +361,6 @@ def download_youtube_sync(url: str, target_dir: str) -> None:
     cleaned_url = clean_youtube_url(url)
 
     ydl_opts = {
-        # 'bv*+ba/best' requests highest available resolution (4K 2160p / 1080p 60fps)
         "format": "bv*+ba/best",
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
@@ -359,13 +368,11 @@ def download_youtube_sync(url: str, target_dir: str) -> None:
         "no_warnings": True,
         "restrictfilenames": True,
         "noplaylist": True,
-        # iOS and Android clients serve unthrottled 4K streams without triggering PO Token reload errors
         "extractor_args": {
             "youtube": {
                 "player_client": ["ios", "android"]
             }
         },
-        # Re-encode to H.264 + AAC so mobile devices and Telegram can stream the 4K MP4 file
         "postprocessor_args": {
             "ffmpeg": [
                 "-c:v", "libx264",
@@ -377,9 +384,6 @@ def download_youtube_sync(url: str, target_dir: str) -> None:
             ]
         },
     }
-
-    # NOTE: We do NOT load cookie_path for YouTube here.
-    # Passing web cookies causes yt-dlp to skip iOS/Android endpoints, dropping resolution down to 720p.
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -488,7 +492,6 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     text = message.text
 
-    # Route request based on matchers
     is_instagram = INSTAGRAM_HOST_RE.search(text)
     is_youtube = YOUTUBE_RE.search(text)
 
@@ -498,7 +501,6 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     post_match = POST_RE.search(text) if is_instagram else None
     story_match = STORY_RE.search(text) if is_instagram else None
 
-    # If it matched instagram host but not a supported post/story structure, ignore
     if is_instagram and not post_match and not story_match:
         return
 
@@ -564,9 +566,31 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             media_group: list[InputMediaDocument] = []
             for path in entries:
                 handle = stack.enter_context(path.open("rb"))
+                
+                caption = None
+                if is_instagram:
+                    parts = path.name.split('_')
+                    if len(parts) >= 3 and parts[0].count('-') == 2:
+                        date_str = parts[0].replace('-', '')
+                        ig_user = parts[1]
+                        
+                        if story_match:
+                            ig_type = "IGS"
+                        elif post_match and "/reel/" in text.lower():
+                            ig_type = "IGReels"
+                        else:
+                            ig_type = "IG"
+                            
+                        caption = f"#{date_str} #{ig_user}{ig_type}"
+
                 media_group.append(
-                    InputMediaDocument(media=handle, filename=_friendly_filename(path.name))
+                    InputMediaDocument(
+                        media=handle, 
+                        filename=_friendly_filename(path.name),
+                        caption=caption
+                    )
                 )
+
             for i in range(0, len(media_group), TELEGRAM_MEDIA_GROUP_LIMIT):
                 await context.bot.send_media_group(
                     chat_id=chat_id,
