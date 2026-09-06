@@ -564,11 +564,11 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         with ExitStack() as stack:
             media_group: list[InputMediaDocument] = []
-            for path in entries:
+            for i, path in enumerate(entries):
                 handle = stack.enter_context(path.open("rb"))
                 
                 caption = None
-                if is_instagram:
+                if i == len(entries) - 1 and is_instagram:
                     parts = path.name.split('_')
                     if len(parts) >= 3 and parts[0].count('-') == 2:
                         date_str = parts[0].replace('-', '')
