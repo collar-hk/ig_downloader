@@ -14,6 +14,7 @@ import tempfile
 import threading
 import uuid
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -47,6 +48,11 @@ MAX_GLOBAL_DOWNLOADS = 5
 DOWNLOAD_TIMEOUT_SECONDS = 600  # Extended timeout for 4K video downloads and re-encoding
 TELEGRAM_MEDIA_GROUP_LIMIT = 10
 MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png", ".webp"}
+
+# Instagram web app identifiers. Required for /api/v1/feed/reels_media/
+# (the GraphQL stories query Instaloader still uses is retired).
+IG_WEB_APP_ID = "936619743392459"
+IG_WEB_ASBD_ID = "129477"
 
 CACHE_PATH = Path(os.environ.get("USER_ID_CACHE_PATH", "user_id_cache.json"))
 
@@ -296,8 +302,194 @@ def download_post_sync(shortcode: str, target_dir: str) -> None:
 def _story_item_matches(item: Any, media_id: str | None) -> bool:
     if not media_id:
         return True
-    item_id = str(item.mediaid)
-    return item_id == media_id or item_id.startswith(media_id)
+    raw = str(getattr(item, "mediaid", "") or item)
+    pk = raw.split("_")[0]
+    return pk == media_id or raw == media_id or raw.startswith(media_id) or media_id.startswith(pk)
+
+
+def _reel_item_id(item: dict[str, Any]) -> str:
+    raw = str(item.get("pk") or item.get("id") or "")
+    return raw.split("_")[0]
+
+
+def _reel_item_matches(item: dict[str, Any], media_id: str | None) -> bool:
+    if not media_id:
+        return True
+    item_id = _reel_item_id(item)
+    raw = str(item.get("pk") or item.get("id") or "")
+    return item_id == media_id or raw == media_id or raw.startswith(media_id) or media_id.startswith(item_id)
+
+
+def _best_media_url(item: dict[str, Any]) -> tuple[str, str, bool]:
+    """Return (url, extension, is_video) at the highest available resolution."""
+    is_video = int(item.get("media_type") or 0) == 2 or bool(item.get("video_versions"))
+    if is_video:
+        versions = sorted(
+            item.get("video_versions") or [],
+            key=lambda v: (int(v.get("width") or 0), int(v.get("height") or 0)),
+            reverse=True,
+        )
+        for version in versions:
+            url = version.get("url")
+            if url:
+                return url, ".mp4", True
+        raise DownloadError("Story video is missing a downloadable URL.")
+
+    candidates = sorted(
+        (item.get("image_versions2") or {}).get("candidates") or [],
+        key=lambda c: (int(c.get("width") or 0), int(c.get("height") or 0)),
+        reverse=True,
+    )
+    for candidate in candidates:
+        url = candidate.get("url")
+        if url:
+            return url, ".jpg", False
+    raise DownloadError("Story photo is missing a downloadable URL.")
+
+
+def _web_story_headers(session: Any) -> dict[str, str]:
+    headers = {
+        "X-IG-App-ID": IG_WEB_APP_ID,
+        "X-ASBD-ID": IG_WEB_ASBD_ID,
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.instagram.com/",
+        "Accept": "*/*",
+        "Origin": "https://www.instagram.com",
+    }
+    try:
+        csrf = session.cookies.get("csrftoken")
+    except Exception:
+        csrf = None
+    if csrf:
+        headers["X-CSRFToken"] = csrf
+    return headers
+
+
+def _parse_reels_payload(data: Any, user_id: int) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+
+    reel = None
+    reels = data.get("reels")
+    if isinstance(reels, dict):
+        reel = reels.get(str(user_id)) or reels.get(user_id)
+        if reel is None:
+            for value in reels.values():
+                if isinstance(value, dict) and str(value.get("id") or value.get("pk") or "") == str(user_id):
+                    reel = value
+                    break
+    if not reel:
+        for media in data.get("reels_media") or []:
+            if not isinstance(media, dict):
+                continue
+            rid = str(media.get("id") or media.get("pk") or "")
+            owner = str((media.get("user") or {}).get("pk") or (media.get("user") or {}).get("id") or "")
+            if rid == str(user_id) or owner == str(user_id):
+                reel = media
+                break
+    if not reel and isinstance(data.get("reel"), dict):
+        reel = data["reel"]
+    if not isinstance(reel, dict):
+        return []
+    items = reel.get("items") or []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[dict[str, Any]]:
+    """Fetch active stories via Instagram's current REST API.
+
+    Instaloader.get_stories() still uses GraphQL query_hash
+    303a4ae99711322310f25250d988f3b7, which Instagram rejects with
+    400 "invalid request". The web /api/v1/feed/reels_media/ endpoint is
+    what instagram.com and yt-dlp use today.
+    """
+    session = loader.context._session
+    timeout = getattr(loader.context, "request_timeout", 60) or 60
+    headers = _web_story_headers(session)
+    errors: list[str] = []
+
+    web_urls = [
+        f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
+        f"https://www.instagram.com/api/v1/feed/user/{user_id}/story/",
+    ]
+    for url in web_urls:
+        try:
+            resp = session.get(url, headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                errors.append(f"{url} -> HTTP {resp.status_code}")
+                logger.warning("Stories endpoint %s returned HTTP %s", url, resp.status_code)
+                continue
+            try:
+                payload = resp.json()
+            except ValueError:
+                errors.append(f"{url} -> non-JSON response")
+                continue
+            items = _parse_reels_payload(payload, user_id)
+            if items:
+                logger.info("Fetched %s story item(s) for user %s via %s", len(items), user_id, url)
+                return items
+            # Empty list can mean "no stories" rather than a failed call.
+            if payload.get("status") == "ok" or "reels" in payload or "reels_media" in payload or "reel" in payload:
+                logger.info("Stories tray empty for user %s via %s", user_id, url)
+                return []
+            errors.append(f"{url} -> unexpected payload keys {list(payload)[:8]}")
+        except Exception as exc:
+            errors.append(f"{url} -> {exc}")
+            logger.warning("Stories endpoint %s failed: %s", url, exc)
+
+    try:
+        payload = loader.context.get_iphone_json(
+            path=f"api/v1/feed/reels_media/?reel_ids={user_id}",
+            params={},
+        )
+        items = _parse_reels_payload(payload, user_id)
+        if items or (isinstance(payload, dict) and payload.get("status") == "ok"):
+            logger.info("Fetched %s story item(s) for user %s via iPhone API", len(items), user_id)
+            return items
+        errors.append("iPhone reels_media -> empty/unexpected payload")
+    except Exception as exc:
+        errors.append(f"iPhone reels_media -> {exc}")
+        logger.warning("iPhone stories API failed: %s", exc)
+
+    raise DownloadError(
+        "Instagram rejected the stories request (the old GraphQL stories query is dead). "
+        + "; ".join(errors[-3:])
+    )
+
+
+def _download_story_file(session: Any, url: str, dest: Path) -> None:
+    with session.get(url, stream=True, timeout=120) as resp:
+        resp.raise_for_status()
+        with dest.open("wb") as handle:
+            for chunk in resp.iter_content(chunk_size=256 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+
+def _save_story_item(
+    session: Any,
+    item: dict[str, Any],
+    username: str,
+    target_dir: str,
+) -> Path:
+    media_url, suffix, is_video = _best_media_url(item)
+    taken_at = int(item.get("taken_at") or item.get("taken_at_timestamp") or 0)
+    if taken_at:
+        date_str = datetime.fromtimestamp(taken_at, tz=timezone.utc).strftime("%Y-%m-%d")
+    else:
+        date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    media_id = _reel_item_id(item) or uuid.uuid4().hex[:12]
+    # Keep Instaloader's typename tokens so Telegram captions still parse as
+    # #{YYYYMMDD} #{username}IGS after splitting on underscores.
+    kind = "GraphStoryVideo" if is_video else "GraphStoryImage"
+    filename = f"{date_str}_{username}_{kind}_{media_id}{suffix}"
+    dest = Path(target_dir) / filename
+    _download_story_file(session, media_url, dest)
+    if dest.stat().st_size == 0:
+        dest.unlink(missing_ok=True)
+        raise DownloadError(f"Downloaded empty file for story {media_id}.")
+    logger.info("Saved story %s (%s bytes)", dest.name, dest.stat().st_size)
+    return dest
 
 
 def download_story_sync(username: str, media_id: str | None, target_dir: str) -> None:
@@ -308,17 +500,20 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
     for attempt in range(attempts):
         try:
             loader, current_user = get_thread_safe_loader(rotate_session=(attempt > 0))
+            if not current_user:
+                raise DownloadError(
+                    "Stories require a logged-in Instagram session. "
+                    "Place an ig_session_<username> file next to the bot."
+                )
             user_id = resolve_instagram_user_id(loader, username)
+            items = _fetch_reels_media(loader, user_id)
             found = False
-            for story in loader.get_stories(userids=[user_id]):
-                for item in story.get_items():
-                    if not _story_item_matches(item, media_id):
-                        continue
-                    loader.download_storyitem(item, target=Path(target_dir))
-                    found = True
-                    if media_id:
-                        break
-                if found and media_id:
+            for item in items:
+                if not _reel_item_matches(item, media_id):
+                    continue
+                _save_story_item(loader.context._session, item, username, target_dir)
+                found = True
+                if media_id:
                     break
 
             if not found and media_id:
