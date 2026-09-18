@@ -226,14 +226,28 @@ def get_thread_safe_loader(rotate_session: bool = False) -> tuple[instaloader.In
     if ig_user and session_path and session_path.exists():
         try:
             loader.load_session_from_file(ig_user, str(session_path))
-            logger.info("Thread %s using session file: %s", threading.get_ident(), session_path.name)
-        except (OSError, instaloader.exceptions.InstaloaderException) as exc:
-            logger.error("Failed to load session file %s: %s", session_path, exc)
-            ig_user = None
+            # Verify the session is actually usable
+            logged_in_user = loader.test_login()
+            if logged_in_user:
+                logger.info(
+                    "Thread %s using session file: %s (logged in as %s)",
+                    threading.get_ident(), session_path.name, logged_in_user
+                )
+                _tls.loader = loader
+                _tls.current_username = logged_in_user  # use the real username returned by Instagram
+                return loader, logged_in_user
+            else:
+                logger.warning("Session file %s loaded but test_login() returned None", session_path.name)
+        except Exception as exc:
+            logger.error(
+                "Failed to load session file %s (tried username '%s'): %s: %s",
+                session_path.name, ig_user, type(exc).__name__, exc
+            )
 
+    # No usable session
     _tls.loader = loader
-    _tls.current_username = ig_user
-    return loader, ig_user
+    _tls.current_username = None
+    return loader, None
 
 
 def _cookies_to_netscape(loader: instaloader.Instaloader, path: Path) -> None:
