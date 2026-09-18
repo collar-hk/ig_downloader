@@ -52,7 +52,9 @@ MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png", ".webp"}
 # Instagram web app identifiers. Required for /api/v1/feed/reels_media/
 # (the GraphQL stories query Instaloader still uses is retired).
 IG_WEB_APP_ID = "936619743392459"
-IG_WEB_ASBD_ID = "129477"
+# yt-dlp's current story extractor. The older 129477 id is tried if this is rejected.
+IG_WEB_ASBD_ID = "359341"
+IG_WEB_ASBD_ID_FALLBACK = "129477"
 
 CACHE_PATH = Path(os.environ.get("USER_ID_CACHE_PATH", "user_id_cache.json"))
 
@@ -156,6 +158,13 @@ def cache_set(username: str, user_id: int) -> None:
     save_user_id_cache()
 
 
+def cache_delete(username: str) -> None:
+    key = _normalize_username(username)
+    with _cache_lock:
+        _user_id_cache.pop(key, None)
+    save_user_id_cache()
+
+
 def get_user_id_from_public_html(username: str) -> int | None:
     """Scrape profile_id from public HTML, optionally attaching session cookies."""
     url = f"https://www.instagram.com/{username}/"
@@ -252,6 +261,25 @@ def _friendly_filename(name: str) -> str:
     return name
 
 
+def get_user_id_from_web_api(loader: instaloader.Instaloader, username: str) -> int | None:
+    """Resolve a profile id via the logged-in web_profile_info endpoint."""
+    session = loader.context._session
+    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    try:
+        resp = session.get(url, headers=_web_story_headers(session))
+        if resp.status_code != 200:
+            logger.warning("web_profile_info for @%s returned HTTP %s", username, resp.status_code)
+            return None
+        user = ((resp.json() or {}).get("data") or {}).get("user") or {}
+        raw_id = user.get("id") or user.get("pk")
+        if raw_id is not None and str(raw_id).isdigit():
+            logger.info("Resolved @%s to %s via web_profile_info", username, raw_id)
+            return int(raw_id)
+    except Exception as exc:
+        logger.warning("web_profile_info failed for @%s: %s", username, exc)
+    return None
+
+
 def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) -> int:
     username = _normalize_username(username)
 
@@ -261,6 +289,11 @@ def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) ->
         return cached
 
     logger.info("Cache miss for @%s; attempting resolution", username)
+
+    user_id = get_user_id_from_web_api(loader, username)
+    if user_id:
+        cache_set(username, user_id)
+        return user_id
 
     user_id = get_user_id_from_public_html(username)
     if user_id:
@@ -322,10 +355,13 @@ def _reel_item_matches(item: dict[str, Any], media_id: str | None) -> bool:
 
 def _best_media_url(item: dict[str, Any]) -> tuple[str, str, bool]:
     """Return (url, extension, is_video) at the highest available resolution."""
-    is_video = int(item.get("media_type") or 0) == 2 or bool(item.get("video_versions"))
+    versions = item.get("video_versions") or []
+    is_video = int(item.get("media_type") or 0) == 2 or bool(versions) or bool(item.get("video_url"))
     if is_video:
+        if not isinstance(versions, list):
+            versions = []
         versions = sorted(
-            item.get("video_versions") or [],
+            [v for v in versions if isinstance(v, dict)],
             key=lambda v: (int(v.get("width") or 0), int(v.get("height") or 0)),
             reverse=True,
         )
@@ -333,10 +369,17 @@ def _best_media_url(item: dict[str, Any]) -> tuple[str, str, bool]:
             url = version.get("url")
             if url:
                 return url, ".mp4", True
+        direct = item.get("video_url")
+        if direct:
+            return direct, ".mp4", True
         raise DownloadError("Story video is missing a downloadable URL.")
 
+    image_versions = item.get("image_versions2") or {}
+    candidates = image_versions.get("candidates") if isinstance(image_versions, dict) else []
+    if not isinstance(candidates, list):
+        candidates = []
     candidates = sorted(
-        (item.get("image_versions2") or {}).get("candidates") or [],
+        [c for c in candidates if isinstance(c, dict)],
         key=lambda c: (int(c.get("width") or 0), int(c.get("height") or 0)),
         reverse=True,
     )
@@ -344,17 +387,27 @@ def _best_media_url(item: dict[str, Any]) -> tuple[str, str, bool]:
         url = candidate.get("url")
         if url:
             return url, ".jpg", False
+    direct = item.get("display_url") or item.get("display_uri")
+    if direct:
+        return direct, ".jpg", False
     raise DownloadError("Story photo is missing a downloadable URL.")
 
 
-def _web_story_headers(session: Any) -> dict[str, str]:
-    headers = {
+def _web_story_headers(session: Any, asbd_id: str = IG_WEB_ASBD_ID) -> dict[str, Any]:
+    headers: dict[str, Any] = {
         "X-IG-App-ID": IG_WEB_APP_ID,
-        "X-ASBD-ID": IG_WEB_ASBD_ID,
+        "X-ASBD-ID": asbd_id,
+        "X-IG-WWW-Claim": "0",
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://www.instagram.com/",
         "Accept": "*/*",
         "Origin": "https://www.instagram.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        # Instaloader pins Content-Length: 0 on the session. requests drops a
+        # session header when the per-request value is None.
+        "Content-Length": None,
     }
     try:
         csrf = session.cookies.get("csrftoken")
@@ -365,9 +418,20 @@ def _web_story_headers(session: Any) -> dict[str, str]:
     return headers
 
 
-def _parse_reels_payload(data: Any, user_id: int) -> list[dict[str, Any]]:
+def _remember_www_claim(headers: dict[str, Any], response: Any) -> bool:
+    try:
+        claim = response.headers.get("x-ig-set-www-claim")
+    except Exception:
+        claim = None
+    if claim and claim != headers.get("X-IG-WWW-Claim"):
+        headers["X-IG-WWW-Claim"] = claim
+        return True
+    return False
+
+
+def _find_reel(data: Any, user_id: int) -> dict[str, Any] | None:
     if not isinstance(data, dict):
-        return []
+        return None
 
     reel = None
     reels = data.get("reels")
@@ -389,10 +453,31 @@ def _parse_reels_payload(data: Any, user_id: int) -> list[dict[str, Any]]:
                 break
     if not reel and isinstance(data.get("reel"), dict):
         reel = data["reel"]
-    if not isinstance(reel, dict):
+    return reel if isinstance(reel, dict) else None
+
+
+def _parse_reels_payload(data: Any, user_id: int) -> list[dict[str, Any]]:
+    reel = _find_reel(data, user_id)
+    if not reel:
         return []
     items = reel.get("items") or []
     return [item for item in items if isinstance(item, dict)]
+
+
+def _story_api_get(session: Any, url: str, headers: dict[str, Any], user_id: int) -> Any:
+    """GET a stories endpoint, then retry once if Instagram issues a www-claim."""
+    resp = session.get(url, headers=headers)
+    claim_changed = _remember_www_claim(headers, resp)
+    if resp.status_code != 200 or not claim_changed:
+        return resp
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+    if _parse_reels_payload(payload, user_id):
+        return resp
+    logger.info("Retrying %s after Instagram set X-IG-WWW-Claim", url)
+    return session.get(url, headers=headers)
 
 
 def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[dict[str, Any]]:
@@ -404,38 +489,44 @@ def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[di
     what instagram.com and yt-dlp use today.
     """
     session = loader.context._session
-    timeout = getattr(loader.context, "request_timeout", 60) or 60
-    headers = _web_story_headers(session)
     errors: list[str] = []
+    confirmed_empty = False
 
     web_urls = [
         f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
         f"https://www.instagram.com/api/v1/feed/user/{user_id}/story/",
     ]
-    for url in web_urls:
-        try:
-            resp = session.get(url, headers=headers, timeout=timeout)
-            if resp.status_code != 200:
-                errors.append(f"{url} -> HTTP {resp.status_code}")
-                logger.warning("Stories endpoint %s returned HTTP %s", url, resp.status_code)
-                continue
+    for asbd_id in (IG_WEB_ASBD_ID, IG_WEB_ASBD_ID_FALLBACK):
+        headers = _web_story_headers(session, asbd_id)
+        for url in web_urls:
             try:
-                payload = resp.json()
-            except ValueError:
-                errors.append(f"{url} -> non-JSON response")
-                continue
-            items = _parse_reels_payload(payload, user_id)
-            if items:
-                logger.info("Fetched %s story item(s) for user %s via %s", len(items), user_id, url)
-                return items
-            # Empty list can mean "no stories" rather than a failed call.
-            if payload.get("status") == "ok" or "reels" in payload or "reels_media" in payload or "reel" in payload:
-                logger.info("Stories tray empty for user %s via %s", user_id, url)
-                return []
-            errors.append(f"{url} -> unexpected payload keys {list(payload)[:8]}")
-        except Exception as exc:
-            errors.append(f"{url} -> {exc}")
-            logger.warning("Stories endpoint %s failed: %s", url, exc)
+                resp = _story_api_get(session, url, headers, user_id)
+                if resp.status_code != 200:
+                    errors.append(f"{url} asbd={asbd_id} -> HTTP {resp.status_code}")
+                    logger.warning("Stories endpoint %s returned HTTP %s", url, resp.status_code)
+                    continue
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    errors.append(f"{url} asbd={asbd_id} -> non-JSON response")
+                    continue
+                items = _parse_reels_payload(payload, user_id)
+                if items:
+                    logger.info("Fetched %s story item(s) for user %s via %s", len(items), user_id, url)
+                    return items
+                if _find_reel(payload, user_id) is not None:
+                    confirmed_empty = True
+                    logger.info("Stories tray empty for user %s via %s", user_id, url)
+                    continue
+                snippet = ""
+                if isinstance(payload, dict):
+                    snippet = " keys " + ",".join(list(payload)[:8])
+                errors.append(f"{url} asbd={asbd_id} -> no reel{snippet}")
+            except Exception as exc:
+                errors.append(f"{url} asbd={asbd_id} -> {exc}")
+                logger.warning("Stories endpoint %s failed: %s", url, exc)
+        if confirmed_empty:
+            return []
 
     try:
         payload = loader.context.get_iphone_json(
@@ -443,13 +534,18 @@ def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[di
             params={},
         )
         items = _parse_reels_payload(payload, user_id)
-        if items or (isinstance(payload, dict) and payload.get("status") == "ok"):
+        if items:
             logger.info("Fetched %s story item(s) for user %s via iPhone API", len(items), user_id)
             return items
+        if _find_reel(payload, user_id) is not None:
+            return []
         errors.append("iPhone reels_media -> empty/unexpected payload")
     except Exception as exc:
         errors.append(f"iPhone reels_media -> {exc}")
         logger.warning("iPhone stories API failed: %s", exc)
+
+    if confirmed_empty:
+        return []
 
     raise DownloadError(
         "Instagram rejected the stories request (the old GraphQL stories query is dead). "
@@ -457,13 +553,60 @@ def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[di
     )
 
 
+def _write_http_body(response: Any, dest: Path) -> None:
+    with dest.open("wb") as handle:
+        while True:
+            chunk = response.read(256 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
+
+
+def _cookie_header(session: Any) -> str:
+    try:
+        pairs = [f"{cookie.name}={cookie.value}" for cookie in session.cookies]
+    except Exception:
+        return ""
+    return "; ".join(pairs)
+
+
 def _download_story_file(session: Any, url: str, dest: Path) -> None:
-    with session.get(url, stream=True, timeout=120) as resp:
-        resp.raise_for_status()
-        with dest.open("wb") as handle:
-            for chunk in resp.iter_content(chunk_size=256 * 1024):
-                if chunk:
-                    handle.write(chunk)
+    """Download a signed story URL.
+
+    The CDN returns 403 when the request uses Instaloader's session headers
+    (Chrome user-agent, Content-Length: 0, API cookies). A bare Mozilla/5.0
+    user-agent with no cookies is what currently works.
+    """
+    anon_headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        with urlopen(Request(url, headers=anon_headers), timeout=120) as response:
+            _write_http_body(response, dest)
+            return
+    except HTTPError as exc:
+        if exc.code not in (401, 403):
+            raise DownloadError(f"Story media download failed: HTTP {exc.code}") from exc
+        logger.warning("Anonymous story download got HTTP %s; retrying with session cookies", exc.code)
+    except (URLError, TimeoutError, OSError) as exc:
+        logger.warning("Anonymous story download failed (%s); retrying with session cookies", exc)
+
+    headers = dict(anon_headers)
+    cookie_header = _cookie_header(session)
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    try:
+        with urlopen(Request(url, headers=headers), timeout=120) as response:
+            _write_http_body(response, dest)
+    except HTTPError as exc:
+        raise DownloadError(f"Story media download failed: HTTP {exc.code}") from exc
+
+
+def _file_is_error_page(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(32).lstrip().lower()
+    except OSError:
+        return True
+    return head.startswith((b"<!doctype", b"<html", b"<head", b"{"))
 
 
 def _save_story_item(
@@ -485,17 +628,66 @@ def _save_story_item(
     filename = f"{date_str}_{username}_{kind}_{media_id}{suffix}"
     dest = Path(target_dir) / filename
     _download_story_file(session, media_url, dest)
-    if dest.stat().st_size == 0:
+    if dest.stat().st_size == 0 or _file_is_error_page(dest):
         dest.unlink(missing_ok=True)
-        raise DownloadError(f"Downloaded empty file for story {media_id}.")
+        raise DownloadError(f"Downloaded empty or invalid file for story {media_id}.")
     logger.info("Saved story %s (%s bytes)", dest.name, dest.stat().st_size)
     return dest
+
+
+def _tray_has_requested_story(items: list[dict[str, Any]], media_id: str | None) -> bool:
+    if not items:
+        return False
+    if not media_id:
+        return True
+    return any(_reel_item_matches(item, media_id) for item in items)
+
+
+def _load_story_items(
+    loader: instaloader.Instaloader,
+    username: str,
+    media_id: str | None,
+) -> list[dict[str, Any]]:
+    cached_before = cache_get(username)
+    user_id = resolve_instagram_user_id(loader, username)
+    try:
+        items = _fetch_reels_media(loader, user_id)
+    except DownloadError as exc:
+        if cached_before is None:
+            raise
+        logger.info("Story request failed for cached id %s; resolving @%s again", cached_before, username)
+        cache_delete(username)
+        try:
+            refreshed_id = resolve_instagram_user_id(loader, username)
+        except DownloadError:
+            raise exc
+        if refreshed_id == user_id:
+            raise exc
+        return _fetch_reels_media(loader, refreshed_id)
+
+    if _tray_has_requested_story(items, media_id) or cached_before is None:
+        return items
+
+    logger.info(
+        "Cached id %s did not contain the requested story; resolving @%s again",
+        cached_before,
+        username,
+    )
+    cache_delete(username)
+    try:
+        refreshed_id = resolve_instagram_user_id(loader, username)
+    except DownloadError:
+        return items
+    if refreshed_id == user_id:
+        return items
+    return _fetch_reels_media(loader, refreshed_id)
 
 
 def download_story_sync(username: str, media_id: str | None, target_dir: str) -> None:
     username = _normalize_username(username)
     session_files = get_available_session_files()
     attempts = max(1, len(session_files))
+    current_user: str | None = None
 
     for attempt in range(attempts):
         try:
@@ -505,8 +697,7 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
                     "Stories require a logged-in Instagram session. "
                     "Place an ig_session_<username> file next to the bot."
                 )
-            user_id = resolve_instagram_user_id(loader, username)
-            items = _fetch_reels_media(loader, user_id)
+            items = _load_story_items(loader, username, media_id)
             found = False
             for item in items:
                 if not _reel_item_matches(item, media_id):
@@ -516,13 +707,27 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
                 if media_id:
                     break
 
-            if not found and media_id:
-                raise DownloadError("That story was not found or has expired.")
-            if not found:
-                raise DownloadError("No active stories found for that account.")
-            return
-        except DownloadError:
-            raise
+            if found:
+                return
+            if media_id:
+                available = ", ".join(_reel_item_id(item) for item in items[:8]) or "none"
+                raise DownloadError(
+                    f"That story was not found or has expired (tray ids: {available})."
+                )
+            raise DownloadError(
+                "No active stories found. The account may have none, or this Instagram session is logged out."
+            )
+        except DownloadError as exc:
+            logger.warning(
+                "Attempt %s failed for story @%s with session '%s': %s",
+                attempt + 1,
+                username,
+                current_user,
+                exc,
+            )
+            if attempt == attempts - 1:
+                log_failed_account(username, str(exc))
+                raise
         except Exception as exc:
             logger.warning(
                 "Attempt %s failed for story @%s with session '%s': %s",

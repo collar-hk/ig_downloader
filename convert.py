@@ -1,7 +1,10 @@
 import http.cookiejar
+from pathlib import Path
+
 import instaloader
 
 USERNAME = "ericpoon2026"
+SCRIPT_DIR = Path(__file__).resolve().parent
 L = instaloader.Instaloader()
 
 # Load cookies
@@ -28,7 +31,9 @@ if csrf_token:
 try:
     logged_in_user = L.test_login()
     print(f"Successfully logged in as: {logged_in_user}")
-    L.save_session_to_file()
-    print("Session saved!")
+    ig_name = logged_in_user or USERNAME
+    session_path = SCRIPT_DIR / f"ig_session_{ig_name}"
+    L.save_session_to_file(str(session_path))
+    print(f"Session saved to {session_path}")
 except Exception as e:
     print(f"Error creating session: {e}")
