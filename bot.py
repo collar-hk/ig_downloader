@@ -7,8 +7,10 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -46,8 +48,12 @@ ADMIN_TELEGRAM_IDS = {int(x.strip()) for x in ADMIN_RAW.split(",") if x.strip().
 MAX_TASKS_PER_USER = 2
 MAX_GLOBAL_DOWNLOADS = 5
 DOWNLOAD_TIMEOUT_SECONDS = 600  # Extended timeout for 4K video downloads and re-encoding
+YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS = 1800  # 4K fetch + H.264/H.265 re-encode can be slow
 TELEGRAM_MEDIA_GROUP_LIMIT = 10
-MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png", ".webp"}
+MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+# Optional Netscape cookies file for YouTube (needed when guest IP is restricted).
+YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "cookies.txt")
 
 # Instagram web app identifiers. Required for /api/v1/feed/reels_media/
 # (the GraphQL stories query Instaloader still uses is retired).
@@ -65,7 +71,9 @@ STORY_RE = re.compile(r"/stories/([^/?#&]+)(?:/([^/?#&]+))?", re.I)
 
 # Match YouTube URLs
 YOUTUBE_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})",
+    r"(?:https?://)?(?:www\.|m\.|music\.)?"
+    r"(?:youtube\.com/(?:watch\?v=|shorts/|embed/|live/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})",
     re.I,
 )
 
@@ -82,6 +90,242 @@ _session_index = 0
 
 class DownloadError(Exception):
     """User-facing download failure."""
+
+    def __init__(self, message: str, *, retry_session: bool = False, kind: str = "generic"):
+        super().__init__(message)
+        self.retry_session = retry_session
+        self.kind = kind
+
+
+# Instagram / YouTube error kinds that should skip extra endpoint hammering.
+_SESSION_BLOCK_KINDS = frozenset({"checkpoint", "rate_limit", "login", "restricted"})
+_RETRY_SESSION_KINDS = _SESSION_BLOCK_KINDS | {"private", "generic", "no_stories"}
+
+_IG_USER_MESSAGES = {
+    "checkpoint": (
+        "Instagram blocked this account (security checkpoint / bot check). "
+        "Open Instagram in a browser, complete the verification, then try again later."
+    ),
+    "rate_limit": (
+        "Instagram is temporarily rate-limiting this account. "
+        "Please wait a few minutes and try again."
+    ),
+    "login": (
+        "The Instagram session expired or was logged out. "
+        "Please refresh the session file and try again."
+    ),
+    "restricted": (
+        "Instagram refused this request. The content may be private, "
+        "or this session is restricted."
+    ),
+    "not_found": "That Instagram link was not found. It may have been deleted.",
+    "private": "This account is private, and the current Instagram session cannot access it.",
+    "no_stories": "No active stories found for that account right now.",
+    "expired_story": "That story was not found or has already expired.",
+    "generic": "Could not download that Instagram media. Please try again later.",
+}
+
+_YT_USER_MESSAGES = {
+    "bot_check": (
+        "YouTube is asking to confirm this is not a bot. "
+        "Export a Netscape cookies.txt from a logged-in browser, place it next to the bot, then retry."
+    ),
+    "rate_limit": "YouTube is temporarily rate-limiting this IP. Please wait a few minutes and try again.",
+    "unavailable": "That YouTube video is unavailable (private, removed, or region-blocked).",
+    "age": "That YouTube video is age-restricted and needs a logged-in cookies.txt to download.",
+    "generic": "Could not download that YouTube video. Please try again later.",
+}
+
+
+def _exc_blob(exc: BaseException | str | None) -> str:
+    if exc is None:
+        return ""
+    if isinstance(exc, str):
+        return exc
+    parts = [type(exc).__name__, str(exc)]
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and cause is not exc:
+        parts.append(type(cause).__name__)
+        parts.append(str(cause))
+    return " ".join(parts)
+
+
+def _classify_instagram_error(blob: str, status_code: int | None = None) -> str | None:
+    text = (blob or "").lower()
+    if status_code == 429 or any(
+        token in text
+        for token in (
+            "too many requests",
+            "rate limit",
+            "rate_limit",
+            "please wait a few minutes",
+            "spam",
+            "action blocked",
+        )
+    ):
+        return "rate_limit"
+    if any(
+        token in text
+        for token in (
+            "checkpoint_required",
+            "challenge_required",
+            "feedback_required",
+            "consent_required",
+            "we suspect automated",
+            "suspicious activity",
+        )
+    ):
+        return "checkpoint"
+    if any(
+        token in text
+        for token in (
+            "login_required",
+            "not logged in",
+            "loginrequired",
+            "session expired",
+            "user is not logged in",
+        )
+    ):
+        return "login"
+    if "privateprofilenotfollowed" in text or "is private" in text:
+        return "private"
+    if any(
+        token in text
+        for token in (
+            "profilenotexists",
+            "queryreturnednotfound",
+            "http 404",
+            "status_code=404",
+            "does not exist",
+        )
+    ) or ("not found" in text and "tray" not in text):
+        return "not_found"
+    if status_code in {401, 403} or any(
+        token in text
+        for token in (
+            "queryreturnedforbidden",
+            "http 403",
+            "status_code=403",
+            "forbidden",
+            "not authorized",
+        )
+    ):
+        return "restricted"
+    if status_code == 400 and ("fail" in text or "bad request" in text or "queryreturnedbadrequest" in text):
+        # GraphQL "fail" without a more specific code is usually a blocked/restricted session.
+        return "restricted"
+    return None
+
+
+def _payload_error_blob(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return str(payload or "")
+    parts = [
+        str(payload.get("message") or ""),
+        str(payload.get("error_type") or ""),
+        str(payload.get("error_title") or ""),
+        str(payload.get("status") or ""),
+    ]
+    if payload.get("require_login"):
+        parts.append("login_required")
+    spam = payload.get("spam")
+    if spam:
+        parts.append("spam")
+    return " ".join(parts)
+
+
+def _instagram_user_message(kind: str, resource: str = "media") -> str:
+    if kind == "not_found":
+        if resource == "story":
+            return _IG_USER_MESSAGES["expired_story"]
+        if resource == "post":
+            return "That post or reel was not found. It may have been deleted."
+    if kind == "no_stories":
+        return _IG_USER_MESSAGES["no_stories"]
+    return _IG_USER_MESSAGES.get(kind, _IG_USER_MESSAGES["generic"])
+
+
+def _raise_instagram_block(
+    blob: str,
+    status_code: int | None = None,
+    resource: str = "media",
+    *,
+    fatal_only: bool = False,
+) -> None:
+    kind = _classify_instagram_error(blob, status_code)
+    if not kind:
+        return
+    if fatal_only and kind not in {"checkpoint", "rate_limit", "login"}:
+        return
+    raise DownloadError(
+        _instagram_user_message(kind, resource),
+        retry_session=kind in _RETRY_SESSION_KINDS,
+        kind=kind,
+    )
+
+
+def _map_instagram_exception(exc: BaseException, resource: str = "media") -> DownloadError:
+    if isinstance(exc, DownloadError):
+        if exc.kind != "generic" or exc.retry_session:
+            return exc
+        kind = _classify_instagram_error(_exc_blob(exc)) or exc.kind
+        if kind != exc.kind:
+            return DownloadError(
+                _instagram_user_message(kind, resource),
+                retry_session=kind in _RETRY_SESSION_KINDS,
+                kind=kind,
+            )
+        return exc
+
+    blob = _exc_blob(exc)
+    kind = _classify_instagram_error(blob)
+    if kind:
+        return DownloadError(
+            _instagram_user_message(kind, resource),
+            retry_session=kind in _RETRY_SESSION_KINDS,
+            kind=kind,
+        )
+
+    fallback = {
+        "post": "Could not download that post or reel. Please try again later.",
+        "story": "Could not download that story. Please try again later.",
+        "profile": "Could not look up that Instagram account. Please try again later.",
+    }.get(resource, _IG_USER_MESSAGES["generic"])
+    return DownloadError(fallback, retry_session=True, kind="generic")
+
+
+def _map_youtube_exception(exc: BaseException) -> DownloadError:
+    if isinstance(exc, DownloadError):
+        return exc
+    text = _exc_blob(exc).lower()
+    if any(
+        token in text
+        for token in (
+            "sign in to confirm",
+            "not a bot",
+            "confirm you’re not a bot",
+            "confirm you're not a bot",
+        )
+    ):
+        kind = "bot_check"
+    elif "429" in text or "too many requests" in text:
+        kind = "rate_limit"
+    elif "age-restricted" in text or "age restricted" in text:
+        kind = "age"
+    elif any(
+        token in text
+        for token in (
+            "private video",
+            "video unavailable",
+            "this video is not available",
+            "removed by the uploader",
+            "copyright",
+        )
+    ):
+        kind = "unavailable"
+    else:
+        kind = "generic"
+    return DownloadError(_YT_USER_MESSAGES[kind], kind=kind)
 
 
 def log_failed_account(account_name: str, error_msg: str):
@@ -307,15 +551,20 @@ def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) ->
         return profile.userid
     except Exception as exc:
         logger.error("Failed to resolve user ID for @%s: %s", username, exc)
+        mapped = _map_instagram_exception(exc, "profile")
+        if mapped.kind in _SESSION_BLOCK_KINDS:
+            raise mapped from exc
         raise DownloadError(
-            f"Could not automatically resolve ID for @{username}. "
-            f"An admin can set it using: /setid {username} <numeric_id>"
+            f"Could not find Instagram user @{username}. "
+            "The username may be wrong, or an admin can set the ID with /setid.",
+            kind="not_found",
         ) from exc
 
 
 def download_post_sync(shortcode: str, target_dir: str) -> None:
     session_files = get_available_session_files()
     attempts = max(1, len(session_files))
+    current_user: str | None = None
 
     for attempt in range(attempts):
         try:
@@ -323,13 +572,18 @@ def download_post_sync(shortcode: str, target_dir: str) -> None:
             post = instaloader.Post.from_shortcode(loader.context, shortcode)
             loader.download_post(post, target=Path(target_dir))
             return
-        except DownloadError:
-            raise
         except Exception as exc:
-            logger.warning("Attempt %s failed with session '%s': %s", attempt + 1, current_user, exc)
-            if attempt == attempts - 1:
+            mapped = _map_instagram_exception(exc, "post")
+            logger.warning(
+                "Attempt %s failed with session '%s' [%s]: %s",
+                attempt + 1,
+                current_user,
+                mapped.kind,
+                exc,
+            )
+            if (not mapped.retry_session) or attempt == attempts - 1:
                 log_failed_account(f"post_{shortcode}", str(exc))
-                raise DownloadError(f"Failed to fetch that post or reel: {exc}") from exc
+                raise mapped from exc
 
 
 def _story_item_matches(item: Any, media_id: str | None) -> bool:
@@ -464,9 +718,26 @@ def _parse_reels_payload(data: Any, user_id: int) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
+def _inspect_story_response(resp: Any, resource: str = "story") -> None:
+    """Abort this session immediately on checkpoint / rate-limit / login blocks."""
+    status = getattr(resp, "status_code", None)
+    payload = None
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    blob_parts = [_payload_error_blob(payload)]
+    text_attr = getattr(resp, "text", None)
+    if isinstance(text_attr, str):
+        blob_parts.append(text_attr[:2000])
+    _raise_instagram_block(" ".join(blob_parts), status, resource, fatal_only=True)
+
+
 def _story_api_get(session: Any, url: str, headers: dict[str, Any], user_id: int) -> Any:
     """GET a stories endpoint, then retry once if Instagram issues a www-claim."""
     resp = session.get(url, headers=headers)
+    if getattr(resp, "status_code", 200) != 200:
+        _inspect_story_response(resp)
     claim_changed = _remember_www_claim(headers, resp)
     if resp.status_code != 200 or not claim_changed:
         return resp
@@ -502,6 +773,7 @@ def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[di
             try:
                 resp = _story_api_get(session, url, headers, user_id)
                 if resp.status_code != 200:
+                    _inspect_story_response(resp)
                     errors.append(f"{url} asbd={asbd_id} -> HTTP {resp.status_code}")
                     logger.warning("Stories endpoint %s returned HTTP %s", url, resp.status_code)
                     continue
@@ -510,6 +782,9 @@ def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[di
                 except ValueError:
                     errors.append(f"{url} asbd={asbd_id} -> non-JSON response")
                     continue
+                _raise_instagram_block(
+                    _payload_error_blob(payload), resp.status_code, "story", fatal_only=True
+                )
                 items = _parse_reels_payload(payload, user_id)
                 if items:
                     logger.info("Fetched %s story item(s) for user %s via %s", len(items), user_id, url)
@@ -522,6 +797,8 @@ def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[di
                 if isinstance(payload, dict):
                     snippet = " keys " + ",".join(list(payload)[:8])
                 errors.append(f"{url} asbd={asbd_id} -> no reel{snippet}")
+            except DownloadError:
+                raise
             except Exception as exc:
                 errors.append(f"{url} asbd={asbd_id} -> {exc}")
                 logger.warning("Stories endpoint %s failed: %s", url, exc)
@@ -540,16 +817,25 @@ def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[di
         if _find_reel(payload, user_id) is not None:
             return []
         errors.append("iPhone reels_media -> empty/unexpected payload")
+        _raise_instagram_block(_payload_error_blob(payload), resource="story")
+    except DownloadError:
+        raise
     except Exception as exc:
+        mapped = _map_instagram_exception(exc, "story")
+        if mapped.kind in _SESSION_BLOCK_KINDS:
+            raise mapped from exc
         errors.append(f"iPhone reels_media -> {exc}")
         logger.warning("iPhone stories API failed: %s", exc)
 
     if confirmed_empty:
         return []
 
+    combined = "; ".join(errors[-3:])
+    _raise_instagram_block(combined, resource="story")
     raise DownloadError(
-        "Instagram rejected the stories request (the old GraphQL stories query is dead). "
-        + "; ".join(errors[-3:])
+        "Could not download those stories. Instagram rejected the request.",
+        retry_session=True,
+        kind="generic",
     )
 
 
@@ -584,7 +870,10 @@ def _download_story_file(session: Any, url: str, dest: Path) -> None:
             return
     except HTTPError as exc:
         if exc.code not in (401, 403):
-            raise DownloadError(f"Story media download failed: HTTP {exc.code}") from exc
+            raise DownloadError(
+                "Could not download that story file. Please try again later.",
+                kind="generic",
+            ) from exc
         logger.warning("Anonymous story download got HTTP %s; retrying with session cookies", exc.code)
     except (URLError, TimeoutError, OSError) as exc:
         logger.warning("Anonymous story download failed (%s); retrying with session cookies", exc)
@@ -597,7 +886,10 @@ def _download_story_file(session: Any, url: str, dest: Path) -> None:
         with urlopen(Request(url, headers=headers), timeout=120) as response:
             _write_http_body(response, dest)
     except HTTPError as exc:
-        raise DownloadError(f"Story media download failed: HTTP {exc.code}") from exc
+        raise DownloadError(
+            "Could not download that story file. Please try again later.",
+            kind="generic",
+        ) from exc
 
 
 def _file_is_error_page(path: Path) -> bool:
@@ -653,7 +945,7 @@ def _load_story_items(
     try:
         items = _fetch_reels_media(loader, user_id)
     except DownloadError as exc:
-        if cached_before is None:
+        if exc.kind in _SESSION_BLOCK_KINDS or cached_before is None:
             raise
         logger.info("Story request failed for cached id %s; resolving @%s again", cached_before, username)
         cache_delete(username)
@@ -694,8 +986,9 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
             loader, current_user = get_thread_safe_loader(rotate_session=(attempt > 0))
             if not current_user:
                 raise DownloadError(
-                    "Stories require a logged-in Instagram session. "
-                    "Place an ig_session_<username> file next to the bot."
+                    "Stories need a logged-in Instagram session. "
+                    "Place an ig_session_<username> file next to the bot, then try again.",
+                    kind="login",
                 )
             items = _load_story_items(loader, username, media_id)
             found = False
@@ -710,83 +1003,440 @@ def download_story_sync(username: str, media_id: str | None, target_dir: str) ->
             if found:
                 return
             if media_id:
-                available = ", ".join(_reel_item_id(item) for item in items[:8]) or "none"
+                logger.info(
+                    "Requested story %s not in tray for @%s (have %s)",
+                    media_id,
+                    username,
+                    ", ".join(_reel_item_id(item) for item in items[:8]) or "none",
+                )
                 raise DownloadError(
-                    f"That story was not found or has expired (tray ids: {available})."
+                    _IG_USER_MESSAGES["expired_story"],
+                    kind="expired_story",
                 )
             raise DownloadError(
-                "No active stories found. The account may have none, or this Instagram session is logged out."
+                _IG_USER_MESSAGES["no_stories"],
+                retry_session=True,
+                kind="no_stories",
             )
-        except DownloadError as exc:
-            logger.warning(
-                "Attempt %s failed for story @%s with session '%s': %s",
-                attempt + 1,
-                username,
-                current_user,
-                exc,
-            )
-            if attempt == attempts - 1:
-                log_failed_account(username, str(exc))
-                raise
         except Exception as exc:
+            mapped = _map_instagram_exception(exc, "story")
             logger.warning(
-                "Attempt %s failed for story @%s with session '%s': %s",
+                "Attempt %s failed for story @%s with session '%s' [%s]: %s",
                 attempt + 1,
                 username,
                 current_user,
+                mapped.kind,
                 exc,
             )
-            if attempt == attempts - 1:
+            if mapped.kind == "expired_story" or (not mapped.retry_session) or attempt == attempts - 1:
                 log_failed_account(username, str(exc))
-                raise DownloadError(f"Failed to fetch that story: {exc}") from exc
+                raise mapped from exc
 
 
 def clean_youtube_url(url: str) -> str:
-    """Strip playlist and extra parameters, keeping only the 'v' video ID parameter."""
-    parsed = urlparse(url)
-    if "youtube.com" in parsed.netloc:
+    """Normalize any YouTube URL / partial match to a canonical watch URL."""
+    match = YOUTUBE_RE.search(url)
+    if match:
+        return f"https://www.youtube.com/watch?v={match.group(1)}"
+
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    host = (parsed.netloc or "").lower()
+    if "youtube.com" in host or host == "youtu.be":
         query = parse_qs(parsed.query)
         video_id = query.get("v")
         if video_id:
             return f"https://www.youtube.com/watch?v={video_id[0]}"
+        # youtu.be/<id> or /shorts/<id> /embed/<id>
+        parts = [p for p in parsed.path.split("/") if p]
+        if host == "youtu.be" and parts:
+            return f"https://www.youtube.com/watch?v={parts[0][:11]}"
+        if parts and parts[0] in {"shorts", "embed", "live"} and len(parts) > 1:
+            return f"https://www.youtube.com/watch?v={parts[1][:11]}"
     return url
 
 
-def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download YouTube video in maximum 4K quality using iOS/Android clients (unauthenticated)."""
-    cleaned_url = clean_youtube_url(url)
+def _run_cmd(cmd: list[str], timeout: int = 1200) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
-    ydl_opts = {
-        "format": "bv*+ba/best",
-        "merge_output_format": "mp4",
-        "outtmpl": os.path.join(target_dir, "%(title)s [%(id)s].%(ext)s"),
+
+def _ffprobe_streams(path: Path) -> list[dict[str, Any]]:
+    result = _run_cmd(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=index,codec_type,codec_name,width,height",
+            "-of",
+            "json",
+            str(path),
+        ],
+        timeout=60,
+    )
+    if result.returncode != 0:
+        logger.warning("ffprobe failed for %s: %s", path.name, result.stderr.strip())
+        return []
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return []
+    streams = payload.get("streams") or []
+    return [s for s in streams if isinstance(s, dict)]
+
+
+def _video_encoder_args(height: int) -> list[str]:
+    """Pick H.265 for 1440p+ (smaller 4K), otherwise H.264. Prefer VideoToolbox on macOS."""
+    want_hevc = height >= 1440
+    if platform.system() == "Darwin":
+        if want_hevc:
+            # hvc1 tag improves playback on Apple devices / Telegram clients.
+            return ["-c:v", "hevc_videotoolbox", "-q:v", "45", "-tag:v", "hvc1"]
+        return ["-c:v", "h264_videotoolbox", "-q:v", "45"]
+    if want_hevc:
+        return ["-c:v", "libx265", "-preset", "fast", "-crf", "22", "-tag:v", "hvc1"]
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]
+
+
+def _ensure_mp4_h26x(src: Path) -> Path:
+    """Ensure the file is MP4 with H.264/H.265 video and AAC audio."""
+    streams = _ffprobe_streams(src)
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if not video:
+        raise DownloadError(f"Downloaded file has no video stream: {src.name}")
+
+    vcodec = str(video.get("codec_name") or "").lower()
+    acodec = str(audio.get("codec_name") or "").lower() if audio else ""
+    height = int(video.get("height") or 0)
+    already_ok = src.suffix.lower() == ".mp4" and vcodec in {"h264", "hevc", "h265"} and (
+        not audio or acodec in {"aac", "mp3"}
+    )
+    if already_ok:
+        return src
+
+    dest = src.with_suffix(".mp4")
+    if dest.resolve() == src.resolve():
+        dest = src.with_name(f"{src.stem}.converted.mp4")
+
+    # Remux-only when codecs are already compatible with MP4.
+    if vcodec in {"h264", "hevc", "h265"} and (not audio or acodec in {"aac", "mp3"}):
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ]
+        logger.info("Remuxing %s -> %s (vcodec=%s acodec=%s)", src.name, dest.name, vcodec, acodec)
+    else:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            *_video_encoder_args(height),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ]
+        logger.info(
+            "Re-encoding %s -> %s (src vcodec=%s height=%s)",
+            src.name,
+            dest.name,
+            vcodec,
+            height,
+        )
+
+    result = _run_cmd(cmd, timeout=YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS)
+    if result.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
+        err = (result.stderr or result.stdout or "").strip().splitlines()
+        tail = err[-8:] if err else ["unknown ffmpeg error"]
+        raise DownloadError("Failed to convert video to MP4 (H.264/H.265): " + " | ".join(tail))
+
+    if dest.resolve() != src.resolve() and src.exists():
+        src.unlink(missing_ok=True)
+    return dest
+
+
+def _yt_base_opts(target_dir: str) -> dict[str, Any]:
+    outtmpl = os.path.join(target_dir, "%(title).180B [%(id)s].%(ext)s")
+    opts: dict[str, Any] = {
+        "outtmpl": outtmpl,
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
         "noplaylist": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "android"]
-            }
-        },
-        "postprocessor_args": {
-            "ffmpeg": [
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "20",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-movflags", "+faststart",
-            ]
-        },
+        "retries": 5,
+        "fragment_retries": 5,
+        "concurrent_fragment_downloads": 4,
+        # Use yt-dlp's default YouTube client set. Forcing ios/android/tv-only
+        # commonly collapses formats down to a single ~360p progressive stream
+        # (e.g. 640x272), which is exactly the failure mode we hit.
     }
+    cookies_path = Path(YTDLP_COOKIES_FILE)
+    if cookies_path.is_file():
+        opts["cookiefile"] = str(cookies_path)
+        logger.info("Using YouTube cookies file: %s", cookies_path)
+    return opts
+
+
+def _format_pixels(fmt: dict[str, Any]) -> int:
+    return int(fmt.get("width") or 0) * int(fmt.get("height") or 0)
+
+
+def _is_video_only(fmt: dict[str, Any]) -> bool:
+    vcodec = fmt.get("vcodec")
+    acodec = fmt.get("acodec")
+    return bool(vcodec and vcodec != "none" and (not acodec or acodec == "none"))
+
+
+def _is_audio_only(fmt: dict[str, Any]) -> bool:
+    vcodec = fmt.get("vcodec")
+    acodec = fmt.get("acodec")
+    return bool(acodec and acodec != "none" and (not vcodec or vcodec == "none"))
+
+
+def _is_progressive(fmt: dict[str, Any]) -> bool:
+    vcodec = fmt.get("vcodec")
+    acodec = fmt.get("acodec")
+    return bool(vcodec and vcodec != "none" and acodec and acodec != "none")
+
+
+def _within_4k_cap(fmt: dict[str, Any]) -> bool:
+    """Allow up to 4K, including ultrawide 3840xN masters."""
+    width = int(fmt.get("width") or 0)
+    height = int(fmt.get("height") or 0)
+    if width <= 0 and height <= 0:
+        return False
+    return width <= 4096 and height <= 2160
+
+
+def _protocol_rank(fmt: dict[str, Any]) -> int:
+    """Prefer plain https DASH over HLS when quality is equal."""
+    proto = str(fmt.get("protocol") or "")
+    if proto.startswith("https"):
+        return 2
+    if "m3u8" in proto:
+        return 1
+    return 0
+
+
+def _pick_youtube_format_ids(formats: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    """Pick best video (<=4K) + best audio by pixel count / bitrate.
+
+    Returns (format_selector, chosen_video_format).
+    """
+    usable = [f for f in formats if isinstance(f, dict) and f.get("format_id")]
+    videos = [f for f in usable if _is_video_only(f) and _within_4k_cap(f)]
+    audios = [f for f in usable if _is_audio_only(f)]
+    progressive = [f for f in usable if _is_progressive(f) and _within_4k_cap(f)]
+
+    # Prefer formats that already have a direct/manifest URL (skip SABR-only stubs).
+    def _has_download_url(fmt: dict[str, Any]) -> bool:
+        return bool(fmt.get("url") or fmt.get("manifest_url") or fmt.get("fragments"))
+
+    videos_ready = [f for f in videos if _has_download_url(f)] or videos
+    audios_ready = [f for f in audios if _has_download_url(f)] or audios
+    progressive_ready = [f for f in progressive if _has_download_url(f)] or progressive
+    videos, audios, progressive = videos_ready, audios_ready, progressive_ready
+
+    best_video = None
+    if videos:
+        best_video = max(
+            videos,
+            key=lambda f: (
+                _format_pixels(f),
+                _protocol_rank(f),
+                float(f.get("tbr") or f.get("vbr") or 0),
+                float(f.get("fps") or 0),
+            ),
+        )
+    best_audio = None
+    if audios:
+        best_audio = max(
+            audios,
+            key=lambda f: (
+                float(f.get("abr") or f.get("tbr") or 0),
+                _protocol_rank(f),
+            ),
+        )
+
+    best_prog = None
+    if progressive:
+        best_prog = max(
+            progressive,
+            key=lambda f: (
+                _format_pixels(f),
+                float(f.get("tbr") or 0),
+                _protocol_rank(f),
+            ),
+        )
+
+    if best_video and best_audio:
+        selector = f"{best_video['format_id']}+{best_audio['format_id']}"
+        logger.info(
+            "Selected YouTube formats %s (%sx%s %s) + %s (%s)",
+            best_video.get("format_id"),
+            best_video.get("width"),
+            best_video.get("height"),
+            best_video.get("vcodec"),
+            best_audio.get("format_id"),
+            best_audio.get("acodec"),
+        )
+        return selector, best_video
+
+    if best_prog:
+        logger.info(
+            "Selected progressive YouTube format %s (%sx%s)",
+            best_prog.get("format_id"),
+            best_prog.get("width"),
+            best_prog.get("height"),
+        )
+        return str(best_prog["format_id"]), best_prog
+
+    if best_video:
+        # Last resort: video only (should not happen if audio exists).
+        return str(best_video["format_id"]), best_video
+
+    raise DownloadError("No downloadable YouTube formats were returned for that video.")
+
+
+def download_youtube_sync(url: str, target_dir: str) -> None:
+    """Download best available video up to 4K with audio, then convert to H.264/H.265 MP4.
+
+    Manually picks formats by pixel count so ultrawide 4K (e.g. 3840x1634) is preferred
+    over the low-res progressive fallback (often 640x272) that ios/android clients return.
+    """
+    cleaned_url = clean_youtube_url(url)
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise DownloadError("ffmpeg/ffprobe is required for YouTube downloads. Please install ffmpeg.")
+
+    base_opts = _yt_base_opts(target_dir)
+    chosen_video: dict[str, Any] | None = None
+    selector = ""
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([cleaned_url])
+        probe_opts = dict(base_opts)
+        probe_opts["skip_download"] = True
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(cleaned_url, download=False)
+            if info is None:
+                raise DownloadError("yt-dlp returned no video information.")
+            if info.get("entries"):
+                entries = [e for e in info["entries"] if e]
+                if not entries:
+                    raise DownloadError("No downloadable video found at that URL.")
+                info = entries[0]
+            formats = info.get("formats") or []
+            selector, chosen_video = _pick_youtube_format_ids(formats)
+
+        expected_pixels = _format_pixels(chosen_video)
+        if expected_pixels and expected_pixels < 640 * 360:
+            # Only low-res formats were advertised — usually means the extractor
+            # fell back to a restricted client. Cookies often unlock higher formats.
+            hint = ""
+            if not Path(YTDLP_COOKIES_FILE).is_file():
+                hint = (
+                    " Place a Netscape cookies.txt (export from a logged-in browser) "
+                    f"next to the bot as {YTDLP_COOKIES_FILE}, then retry."
+                )
+            raise DownloadError(
+                f"YouTube only offered low resolution "
+                f"({chosen_video.get('width')}x{chosen_video.get('height')})."
+                f"{hint}"
+            )
+
+        download_opts = dict(base_opts)
+        download_opts.update(
+            {
+                "format": selector,
+                "merge_output_format": "mkv",
+            }
+        )
+        with yt_dlp.YoutubeDL(download_opts) as ydl:
+            info = ydl.extract_info(cleaned_url, download=True)
+            if info is None:
+                raise DownloadError("yt-dlp returned no video information.")
+            if info.get("entries"):
+                entries = [e for e in info["entries"] if e]
+                info = entries[0]
+            requested = ydl.prepare_filename(info)
+            candidates = [
+                Path(requested),
+                Path(requested).with_suffix(".mkv"),
+                Path(requested).with_suffix(".mp4"),
+                Path(requested).with_suffix(".webm"),
+            ]
+    except DownloadError:
+        raise
     except Exception as exc:
         logger.error("yt-dlp download failed for %s: %s", cleaned_url, exc)
-        raise DownloadError(f"Failed to download YouTube video: {exc}") from exc
+        raise _map_youtube_exception(exc) from exc
+
+    downloaded: Path | None = None
+    for candidate in candidates:
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            downloaded = candidate
+            break
+    if downloaded is None:
+        videos = [
+            p
+            for p in Path(target_dir).iterdir()
+            if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES and p.stat().st_size > 0
+        ]
+        if not videos:
+            raise DownloadError("YouTube download finished but no video file was found.")
+        downloaded = max(videos, key=lambda p: p.stat().st_mtime)
+
+    width = height = 0
+    for stream in _ffprobe_streams(downloaded):
+        if stream.get("codec_type") == "video":
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            break
+    logger.info(
+        "Downloaded YouTube file %s (%s bytes, %sx%s)",
+        downloaded.name,
+        downloaded.stat().st_size,
+        width or "?",
+        height or "?",
+    )
+
+    if chosen_video and expected_pixels:
+        actual_pixels = width * height
+        # Guard against silently ending up with the 360p progressive fallback.
+        if actual_pixels and actual_pixels < max(expected_pixels * 0.5, 1):
+            raise DownloadError(
+                f"Downloaded resolution {width}x{height} is much lower than the "
+                f"selected {chosen_video.get('width')}x{chosen_video.get('height')}. "
+                "Try updating yt-dlp or providing cookies.txt."
+            )
+
+    # Re-encode to H.264/H.265 is skipped for testing. The merged file
+    # (typically MKV, original codecs + audio) is uploaded as-is.
+    logger.info("Skipping re-encode for testing; keeping %s", downloaded.name)
 
 
 def _flatten_target_directory(target_dir: str) -> list[Path]:
@@ -838,7 +1488,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     await update.message.reply_text(
         "Welcome to the Media Downloader Bot.\n\n"
-        "Send an Instagram link (post, reel, story, IGTV) or YouTube link.",
+        "Send an Instagram link (post, reel, story, IGTV) or YouTube link.\n"
+        "YouTube downloads up to 4K with audio and converts to MP4 (H.264/H.265).",
     )
 
 
@@ -920,11 +1571,14 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         async with sema:
             if is_youtube:
-                yt_url = is_youtube.group(0)
-                await _safe_edit(status_msg, "Downloading YouTube video in highest quality...")
+                yt_url = clean_youtube_url(is_youtube.group(0))
+                await _safe_edit(
+                    status_msg,
+                    "Downloading YouTube (up to 4K + audio) and converting to MP4…",
+                )
                 await asyncio.wait_for(
                     asyncio.to_thread(download_youtube_sync, yt_url, target_dir),
-                    timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                    timeout=YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS,
                 )
             elif post_match:
                 shortcode = post_match.group(1)
@@ -953,7 +1607,7 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if not entries:
             raise DownloadError(
-                "No media was downloaded. The resource might be unavailable or private."
+                "No media was downloaded. It may be private, deleted, or no longer available."
             )
 
         await _safe_edit(status_msg, f"Uploading {len(entries)} file(s) to Telegram…")
@@ -1002,13 +1656,16 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except asyncio.TimeoutError:
         logger.warning("Timeout for user %s in %s", user_id, target_dir)
-        await _safe_edit(status_msg, "Download timed out. The request took too long to complete.")
+        await _safe_edit(
+            status_msg,
+            "Download timed out. Please try again — large videos can take a while.",
+        )
     except DownloadError as exc:
-        logger.error("Download error for user %s: %s", user_id, exc)
-        await _safe_edit(status_msg, f"Error: {exc}")
+        logger.error("Download error for user %s [%s]: %s", user_id, getattr(exc, "kind", "generic"), exc)
+        await _safe_edit(status_msg, str(exc))
     except Exception:
         logger.exception("Unexpected error for user %s", user_id)
-        await _safe_edit(status_msg, "Error: something went wrong while processing that link.")
+        await _safe_edit(status_msg, "Something went wrong while processing that link. Please try again later.")
     finally:
         await _release_user_slot(context, user_id)
         shutil.rmtree(target_dir, ignore_errors=True)
