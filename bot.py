@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 
 import instaloader
 import yt_dlp
+import time
 from telegram import InputMediaDocument, Update
 from telegram.ext import (
     Application,
@@ -920,6 +921,7 @@ def _save_story_item(
     filename = f"{date_str}_{username}_{kind}_{media_id}{suffix}"
     dest = Path(target_dir) / filename
     _download_story_file(session, media_url, dest)
+    time.sleep(0.5)
     if dest.stat().st_size == 0 or _file_is_error_page(dest):
         dest.unlink(missing_ok=True)
         raise DownloadError(f"Downloaded empty or invalid file for story {media_id}.")
