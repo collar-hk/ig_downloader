@@ -2,31 +2,41 @@ import http.cookiejar
 from pathlib import Path
 
 import instaloader
+import requests.utils
 
 USERNAME = "ericpoon2026"
 SCRIPT_DIR = Path(__file__).resolve().parent
+COOKIE_PATH = SCRIPT_DIR / "instagram_cookies.txt"
 L = instaloader.Instaloader()
 
-# Load cookies
-cookie_jar = http.cookiejar.MozillaCookieJar("instagram_cookies.txt")
+if not COOKIE_PATH.exists():
+    raise SystemExit(f"Cookie file not found: {COOKIE_PATH}")
+
+# Load Netscape cookies from the same folder as this script.
+cookie_jar = http.cookiejar.MozillaCookieJar(str(COOKIE_PATH))
 cookie_jar.load(ignore_discard=True, ignore_expires=True)
 
-# Inject cookies into Instaloader session
-L.context._session.cookies = cookie_jar
+# Copy into a Requests cookie jar (what Instaloader expects to save/load).
+L.context._session.cookies.clear()
+for cookie in cookie_jar:
+    L.context._session.cookies.set_cookie(cookie)
+
+# Prefer username from cookies when present; fall back to USERNAME.
+cookie_map = requests.utils.dict_from_cookiejar(L.context._session.cookies)
+ds_user_id = cookie_map.get("ds_user_id")
 L.context.username = USERNAME
 
-# Extract CSRF token from cookies and attach it to session headers
-csrf_token = None
-for cookie in cookie_jar:
-    if cookie.name == "csrftoken":
-        csrf_token = cookie.value
-        break
-
+csrf_token = cookie_map.get("csrftoken")
 if csrf_token:
     L.context._session.headers.update({
         "X-CSRFToken": csrf_token,
         "Referer": "https://www.instagram.com/",
     })
+
+print(f"Reading cookies from: {COOKIE_PATH}")
+if ds_user_id:
+    print(f"Cookie ds_user_id: {ds_user_id}")
+print(f"Cookie sessionid present: {'sessionid' in cookie_map}")
 
 try:
     logged_in_user = L.test_login()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Instagram & YouTube downloader Telegram bot with multi-session rotation."""
+"""Instagram & YouTube downloader Telegram bot."""
 
 from __future__ import annotations
 
@@ -36,6 +36,8 @@ from telegram.ext import (
     filters,
 )
 
+from story_cache import StoryUnavailable, parse_story_target
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -59,18 +61,19 @@ YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "cookies.txt")
 # Instagram web app identifiers. Required for /api/v1/feed/reels_media/
 # (the GraphQL stories query Instaloader still uses is retired).
 IG_WEB_APP_ID = "936619743392459"
-# yt-dlp's current story extractor. The older 129477 id is tried if this is rejected.
 IG_WEB_ASBD_ID = "359341"
-IG_WEB_ASBD_ID_FALLBACK = "129477"
 
-CACHE_PATH = Path(os.environ.get("USER_ID_CACHE_PATH", "user_id_cache.json"))
+SCRIPT_DIR = Path(__file__).resolve().parent
+CACHE_PATH = Path(os.environ.get("USER_ID_CACHE_PATH", str(SCRIPT_DIR / "user_id_cache.json")))
 # One profile story response is shared by later users. Files stay until the
 # story expires; a story id that was not in the last response is fetched again.
-STORY_CACHE_DIR = Path(os.environ.get("STORY_CACHE_DIR", "story_cache"))
+STORY_CACHE_DIR = Path(os.environ.get("STORY_CACHE_DIR", str(SCRIPT_DIR / "story_cache")))
 STORY_CACHE_URL_TTL_SECONDS = float(os.environ.get("STORY_CACHE_URL_TTL_SECONDS", "900"))
 STORY_CACHE_PROFILE_TTL_SECONDS = float(os.environ.get("STORY_CACHE_PROFILE_TTL_SECONDS", "900"))
 STORY_CACHE_NEGATIVE_SECONDS = float(os.environ.get("STORY_CACHE_NEGATIVE_SECONDS", "20"))
 STORY_CACHE_EMPTY_SECONDS = float(os.environ.get("STORY_CACHE_EMPTY_SECONDS", "20"))
+# Gap between story-tray listings. Cached trays do not wait.
+STORY_TRAY_MIN_INTERVAL_SECONDS = float(os.environ.get("STORY_TRAY_MIN_INTERVAL_SECONDS", "20"))
 
 # Match Instagram URLs
 INSTAGRAM_HOST_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am)/", re.I)
@@ -91,9 +94,8 @@ _tls = threading.local()
 _global_download_sema: asyncio.Semaphore | None = None
 _slot_lock: asyncio.Lock | None = None
 
-# Session Rotation State
-_session_lock = threading.Lock()
-_session_index = 0
+_story_tray_lock = threading.Lock()
+_story_tray_next_at = 0.0
 
 
 class DownloadError(Exception):
@@ -350,23 +352,33 @@ def _normalize_username(username: str) -> str:
 
 
 def get_available_session_files() -> list[Path]:
-    """Find all files starting with 'ig_session_' in the working directory."""
-    return sorted(list(Path(".").glob("ig_session_*")))
+    """Find all ig_session_* files next to bot.py (same folder as convert.py)."""
+    return sorted(SCRIPT_DIR.glob("ig_session_*"))
 
 
-def get_next_session_file() -> tuple[str, Path] | tuple[None, None]:
-    """Get the next session file using round-robin rotation."""
-    global _session_index
+def get_session_file() -> tuple[str, Path] | tuple[None, None]:
+    """Use the first ig_session_* file. Extra session files are ignored."""
     session_files = get_available_session_files()
     if not session_files:
         return None, None
 
-    with _session_lock:
-        selected_file = session_files[_session_index % len(session_files)]
-        _session_index = (_session_index + 1) % len(session_files)
-
-    username = selected_file.name.replace("ig_session_", "")
+    selected_file = session_files[0]
+    username = selected_file.name.replace("ig_session_", "", 1)
     return username, selected_file
+
+
+def _wait_for_story_tray_slot() -> None:
+    """Reserve the next story listing so profiles are not fetched back to back."""
+    global _story_tray_next_at
+    wait = 0.0
+    with _story_tray_lock:
+        now = time.monotonic()
+        if now < _story_tray_next_at:
+            wait = _story_tray_next_at - now
+        _story_tray_next_at = max(now, _story_tray_next_at) + STORY_TRAY_MIN_INTERVAL_SECONDS
+    if wait:
+        logger.info("Waiting %.1fs before the next story listing", wait)
+        time.sleep(wait)
 
 
 def load_user_id_cache() -> None:
@@ -468,13 +480,32 @@ def get_user_id_from_public_html(username: str) -> int | None:
     return None
 
 
-def get_thread_safe_loader(rotate_session: bool = False) -> tuple[instaloader.Instaloader, str | None]:
-    """Gets thread-local Instaloader instance, cycling to next session if requested."""
-    loader = getattr(_tls, "loader", None)
-    current_user = getattr(_tls, "current_username", None)
+def get_thread_safe_loader() -> tuple[instaloader.Instaloader, str | None]:
+    """Return this thread's Instaloader, bound to the single session file.
 
-    if loader is not None and not rotate_session:
-        return loader, current_user
+    Reloads from disk when the session file path or mtime changes so a fresh
+    convert.py login is picked up without requiring a full process restart.
+    """
+    ig_user, session_path = get_session_file()
+    session_mtime: float | None = None
+    if session_path is not None and session_path.exists():
+        try:
+            session_mtime = session_path.stat().st_mtime
+        except OSError:
+            session_mtime = None
+
+    loader = getattr(_tls, "loader", None)
+    cached_user = getattr(_tls, "current_username", None)
+    cached_path = getattr(_tls, "session_path", None)
+    cached_mtime = getattr(_tls, "session_mtime", None)
+
+    if (
+        loader is not None
+        and cached_path == session_path
+        and cached_mtime == session_mtime
+        and cached_user == ig_user
+    ):
+        return loader, cached_user
 
     loader = instaloader.Instaloader(
         filename_pattern="{date_utc:%Y-%m-%d}_{profile}_{typename}_{mediaid}",
@@ -486,17 +517,28 @@ def get_thread_safe_loader(rotate_session: bool = False) -> tuple[instaloader.In
         request_timeout=60.0
     )
 
-    ig_user, session_path = get_next_session_file()
     if ig_user and session_path and session_path.exists():
         try:
             loader.load_session_from_file(ig_user, str(session_path))
-            logger.info("Thread %s using session file: %s", threading.get_ident(), session_path.name)
+            logger.info(
+                "Thread %s using session file: %s (mtime=%s)",
+                threading.get_ident(),
+                session_path.name,
+                session_mtime,
+            )
         except (OSError, instaloader.exceptions.InstaloaderException) as exc:
             logger.error("Failed to load session file %s: %s", session_path, exc)
             ig_user = None
+    else:
+        logger.warning(
+            "No ig_session_* file found in %s; Instagram requests will be anonymous",
+            SCRIPT_DIR,
+        )
 
     _tls.loader = loader
     _tls.current_username = ig_user
+    _tls.session_path = session_path
+    _tls.session_mtime = session_mtime
     return loader, ig_user
 
 
@@ -518,7 +560,7 @@ def get_user_id_from_web_api(loader: instaloader.Instaloader, username: str) -> 
     session = loader.context._session
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     try:
-        resp = session.get(url, headers=_web_story_headers(session))
+        resp = session.get(url, headers=_web_story_headers(session), timeout=30)
         if resp.status_code != 200:
             logger.warning("web_profile_info for @%s returned HTTP %s", username, resp.status_code)
             return None
@@ -570,28 +612,21 @@ def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) ->
 
 
 def download_post_sync(shortcode: str, target_dir: str) -> None:
-    session_files = get_available_session_files()
-    attempts = max(1, len(session_files))
-    current_user: str | None = None
-
-    for attempt in range(attempts):
-        try:
-            loader, current_user = get_thread_safe_loader(rotate_session=(attempt > 0))
-            post = instaloader.Post.from_shortcode(loader.context, shortcode)
-            loader.download_post(post, target=Path(target_dir))
-            return
-        except Exception as exc:
-            mapped = _map_instagram_exception(exc, "post")
-            logger.warning(
-                "Attempt %s failed with session '%s' [%s]: %s",
-                attempt + 1,
-                current_user,
-                mapped.kind,
-                exc,
-            )
-            if (not mapped.retry_session) or attempt == attempts - 1:
-                log_failed_account(f"post_{shortcode}", str(exc))
-                raise mapped from exc
+    loader, current_user = get_thread_safe_loader()
+    try:
+        post = instaloader.Post.from_shortcode(loader.context, shortcode)
+        loader.download_post(post, target=Path(target_dir))
+    except Exception as exc:
+        mapped = _map_instagram_exception(exc, "post")
+        logger.warning(
+            "Post %s failed with session '%s' [%s]: %s",
+            shortcode,
+            current_user,
+            mapped.kind,
+            exc,
+        )
+        log_failed_account(f"post_{shortcode}", str(exc))
+        raise mapped from exc
 
 
 def _story_item_matches(item: Any, media_id: str | None) -> bool:
@@ -743,7 +778,8 @@ def _inspect_story_response(resp: Any, resource: str = "story") -> None:
 
 def _story_api_get(session: Any, url: str, headers: dict[str, Any], user_id: int) -> Any:
     """GET a stories endpoint, then retry once if Instagram issues a www-claim."""
-    resp = session.get(url, headers=headers)
+    # Cap each attempt so a stalled Instagram socket cannot pin a worker thread.
+    resp = session.get(url, headers=headers, timeout=30)
     if getattr(resp, "status_code", 200) != 200:
         _inspect_story_response(resp)
     claim_changed = _remember_www_claim(headers, resp)
@@ -756,95 +792,58 @@ def _story_api_get(session: Any, url: str, headers: dict[str, Any], user_id: int
     if _parse_reels_payload(payload, user_id):
         return resp
     logger.info("Retrying %s after Instagram set X-IG-WWW-Claim", url)
-    return session.get(url, headers=headers)
+    return session.get(url, headers=headers, timeout=30)
+
+
+def _story_rejected(cause: BaseException | None = None) -> DownloadError:
+    error = DownloadError(
+        "Could not download those stories. Instagram rejected the request.",
+        retry_session=False,
+        kind="generic",
+    )
+    if cause is not None:
+        raise error from cause
+    return error
 
 
 def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[dict[str, Any]]:
-    """Fetch active stories via Instagram's current REST API.
-
-    Instaloader.get_stories() still uses GraphQL query_hash
-    303a4ae99711322310f25250d988f3b7, which Instagram rejects with
-    400 "invalid request". The web /api/v1/feed/reels_media/ endpoint is
-    what instagram.com and yt-dlp use today.
-    """
+    """Fetch one profile's active stories with a single reels_media request."""
+    _wait_for_story_tray_slot()
     session = loader.context._session
-    errors: list[str] = []
-    confirmed_empty = False
-
-    web_urls = [
-        f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}",
-        f"https://www.instagram.com/api/v1/feed/user/{user_id}/story/",
-    ]
-    for asbd_id in (IG_WEB_ASBD_ID, IG_WEB_ASBD_ID_FALLBACK):
-        headers = _web_story_headers(session, asbd_id)
-        for url in web_urls:
-            try:
-                resp = _story_api_get(session, url, headers, user_id)
-                if resp.status_code != 200:
-                    _inspect_story_response(resp)
-                    errors.append(f"{url} asbd={asbd_id} -> HTTP {resp.status_code}")
-                    logger.warning("Stories endpoint %s returned HTTP %s", url, resp.status_code)
-                    continue
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    errors.append(f"{url} asbd={asbd_id} -> non-JSON response")
-                    continue
-                _raise_instagram_block(
-                    _payload_error_blob(payload), resp.status_code, "story", fatal_only=True
-                )
-                items = _parse_reels_payload(payload, user_id)
-                if items:
-                    logger.info("Fetched %s story item(s) for user %s via %s", len(items), user_id, url)
-                    return items
-                if _find_reel(payload, user_id) is not None:
-                    confirmed_empty = True
-                    logger.info("Stories tray empty for user %s via %s", user_id, url)
-                    continue
-                snippet = ""
-                if isinstance(payload, dict):
-                    snippet = " keys " + ",".join(list(payload)[:8])
-                errors.append(f"{url} asbd={asbd_id} -> no reel{snippet}")
-            except DownloadError:
-                raise
-            except Exception as exc:
-                errors.append(f"{url} asbd={asbd_id} -> {exc}")
-                logger.warning("Stories endpoint %s failed: %s", url, exc)
-        if confirmed_empty:
-            return []
-
+    url = f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}"
+    headers = _web_story_headers(session)
     try:
-        payload = loader.context.get_iphone_json(
-            path=f"api/v1/feed/reels_media/?reel_ids={user_id}",
-            params={},
-        )
-        items = _parse_reels_payload(payload, user_id)
-        if items:
-            logger.info("Fetched %s story item(s) for user %s via iPhone API", len(items), user_id)
-            return items
-        if _find_reel(payload, user_id) is not None:
-            return []
-        errors.append("iPhone reels_media -> empty/unexpected payload")
-        _raise_instagram_block(_payload_error_blob(payload), resource="story")
+        resp = _story_api_get(session, url, headers, user_id)
     except DownloadError:
         raise
     except Exception as exc:
         mapped = _map_instagram_exception(exc, "story")
         if mapped.kind in _SESSION_BLOCK_KINDS:
             raise mapped from exc
-        errors.append(f"iPhone reels_media -> {exc}")
-        logger.warning("iPhone stories API failed: %s", exc)
+        _story_rejected(exc)
 
-    if confirmed_empty:
-        return []
+    if resp.status_code != 200:
+        _inspect_story_response(resp)
+        blob = getattr(resp, "text", None)
+        _raise_instagram_block(blob if isinstance(blob, str) else "", resp.status_code, "story")
+        raise _story_rejected()
 
-    combined = "; ".join(errors[-3:])
-    _raise_instagram_block(combined, resource="story")
-    raise DownloadError(
-        "Could not download those stories. Instagram rejected the request.",
-        retry_session=True,
-        kind="generic",
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        _story_rejected(exc)
+
+    _raise_instagram_block(
+        _payload_error_blob(payload), resp.status_code, "story", fatal_only=True
     )
+    items = _parse_reels_payload(payload, user_id)
+    if items:
+        logger.info("Fetched %s story item(s) for user %s", len(items), user_id)
+        return items
+    if _find_reel(payload, user_id) is not None:
+        logger.info("Stories tray empty for user %s", user_id)
+        return []
+    raise _story_rejected()
 
 
 def _write_http_body(response: Any, dest: Path) -> None:
@@ -966,7 +965,9 @@ def _load_story_items(
             raise exc
         return _fetch_reels_media(loader, refreshed_id)
 
-    if _tray_has_requested_story(items, media_id) or cached_before is None:
+    # Whole-profile requests (no story id) accept an empty tray as a real answer.
+    # Only a missing concrete story id can mean the cached user id is stale.
+    if media_id is None or _tray_has_requested_story(items, media_id) or cached_before is None:
         return items
 
     logger.info(
@@ -1326,48 +1327,29 @@ STORY_TRAY = ProfileStoryCache()
 
 
 def _fetch_story_tray(username: str, media_id: str | None) -> list[dict[str, Any]]:
-    """Ask Instagram once for every active story, rotating sessions on failure."""
+    """Ask Instagram once for every active story on one session."""
     username = _normalize_username(username)
-    session_files = get_available_session_files()
-    attempts = max(1, len(session_files))
-    current_user: str | None = None
-
-    for attempt in range(attempts):
-        try:
-            loader, current_user = get_thread_safe_loader(rotate_session=(attempt > 0))
-            if not current_user:
-                raise DownloadError(
-                    "Stories need a logged-in Instagram session. "
-                    "Place an ig_session_<username> file next to the bot, then try again.",
-                    kind="login",
-                )
-            items = _load_story_items(loader, username, media_id)
-            # A named story that is missing is still a finished tray: the other
-            # stories in it can be reused. An empty whole-profile tray retries.
-            if items or media_id:
-                return items
-            raise DownloadError(
-                _IG_USER_MESSAGES["no_stories"],
-                retry_session=True,
-                kind="no_stories",
-            )
-        except Exception as exc:
-            mapped = _map_instagram_exception(exc, "story")
-            logger.warning(
-                "Attempt %s failed for story @%s with session '%s' [%s]: %s",
-                attempt + 1,
-                username,
-                current_user,
-                mapped.kind,
-                exc,
-            )
-            keep_trying = mapped.retry_session and mapped.kind != "expired_story" and attempt < attempts - 1
-            if keep_trying:
-                continue
-            if mapped.kind == "no_stories":
-                return []
-            raise mapped from exc
-    return []
+    loader, current_user = get_thread_safe_loader()
+    if not current_user:
+        raise DownloadError(
+            "Stories need a logged-in Instagram session. "
+            "Place an ig_session_<username> file next to the bot, then try again.",
+            kind="login",
+        )
+    try:
+        return _load_story_items(loader, username, media_id)
+    except Exception as exc:
+        mapped = _map_instagram_exception(exc, "story")
+        logger.warning(
+            "Story @%s failed with session '%s' [%s]: %s",
+            username,
+            current_user,
+            mapped.kind,
+            exc,
+        )
+        if mapped.kind == "no_stories":
+            return []
+        raise mapped from exc
 
 
 def _serve_story_request(
@@ -1390,6 +1372,12 @@ def _serve_story_request(
             raise DownloadError(_IG_USER_MESSAGES["expired_story"], kind="expired_story")
         raise DownloadError(_IG_USER_MESSAGES["no_stories"], kind="no_stories")
 
+    logger.info(
+        "Serving %s story item(s) for @%s (story=%s)",
+        len(matched),
+        username,
+        media_id or "*",
+    )
     for item in matched:
         try:
             STORY_TRAY.deliver(username, item, target_dir)
@@ -1871,6 +1859,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "Welcome to the Media Downloader Bot.\n\n"
         "Send an Instagram link (post, reel, story, IGTV) or YouTube link.\n"
+        "Story links can be a specific story id, or just the profile "
+        "(https://www.instagram.com/stories/username/) to grab every active story.\n"
         "YouTube downloads up to 4K with audio and converts to MP4 (H.264/H.265).",
     )
 
@@ -1928,9 +1918,23 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     post_match = POST_RE.search(text) if is_instagram else None
-    story_match = STORY_RE.search(text) if is_instagram else None
+    story_target: tuple[str, str | None] | None = None
+    if is_instagram and not post_match:
+        try:
+            story_target = parse_story_target(text)
+        except StoryUnavailable as exc:
+            await message.reply_text(str(exc))
+            return
+        if story_target is None and STORY_RE.search(text):
+            # Highlight URLs and other non-profile story paths.
+            await message.reply_text(
+                "Cannot download highlights from that URL. "
+                "Send the user's main story link instead "
+                "(for example https://www.instagram.com/stories/username/)."
+            )
+            return
 
-    if is_instagram and not post_match and not story_match:
+    if is_instagram and not post_match and story_target is None:
         return
 
     user = message.from_user
@@ -1949,6 +1953,7 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     sema = _global_download_sema
     assert sema is not None
+    story_match = story_target is not None
 
     try:
         async with sema:
@@ -1968,16 +1973,18 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     asyncio.to_thread(download_post_sync, shortcode, target_dir),
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
                 )
-            elif story_match:
-                username = _normalize_username(story_match.group(1))
-                media_id = story_match.group(2)
-                if username == "highlights":
+            elif story_target:
+                username, media_id = story_target
+                if media_id:
                     await _safe_edit(
                         status_msg,
-                        "Cannot download highlights from that URL. Send the user's main story link instead.",
+                        f"Downloading story {media_id} from @{username}…",
                     )
-                    return
-                await _safe_edit(status_msg, f"Downloading stories for @{username}…")
+                else:
+                    await _safe_edit(
+                        status_msg,
+                        f"Downloading all active stories for @{username}…",
+                    )
                 await asyncio.wait_for(
                     asyncio.to_thread(download_story_sync, username, media_id, target_dir),
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
@@ -2061,6 +2068,8 @@ async def _post_init(application: Application) -> None:
 
     sessions = get_available_session_files()
     logger.info("Detected %d session file(s): %s", len(sessions), [s.name for s in sessions])
+    if len(sessions) > 1:
+        logger.info("Using %s only; extra session files are ignored", sessions[0].name)
 
     if not ADMIN_TELEGRAM_IDS:
         logger.warning("ADMIN_TELEGRAM_IDS is empty; /setid is disabled for everyone.")
