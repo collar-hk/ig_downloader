@@ -60,8 +60,18 @@ YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "cookies.txt")
 
 # Instagram web app identifiers. Required for /api/v1/feed/reels_media/
 # (the GraphQL stories query Instaloader still uses is retired).
+# X-ASBD-ID 129477 is what the current web client sends; 359341 makes
+# Instagram answer "please wait a few minutes" even on a fresh session.
 IG_WEB_APP_ID = "936619743392459"
-IG_WEB_ASBD_ID = "359341"
+IG_WEB_ASBD_ID = "129477"
+IG_WEB_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/155.0.8059.40 Safari/537.36"
+)
+# After Instagram rate-limits this login, skip further API calls so retries
+# do not extend the block.
+IG_RATE_LIMIT_COOLDOWN_SECONDS = float(os.environ.get("IG_RATE_LIMIT_COOLDOWN_SECONDS", "600"))
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_PATH = Path(os.environ.get("USER_ID_CACHE_PATH", str(SCRIPT_DIR / "user_id_cache.json")))
@@ -96,6 +106,8 @@ _slot_lock: asyncio.Lock | None = None
 
 _story_tray_lock = threading.Lock()
 _story_tray_next_at = 0.0
+_ig_cooldown_lock = threading.Lock()
+_ig_cooldown_until = 0.0
 
 
 class DownloadError(Exception):
@@ -255,6 +267,32 @@ def _instagram_user_message(kind: str, resource: str = "media") -> str:
     return _IG_USER_MESSAGES.get(kind, _IG_USER_MESSAGES["generic"])
 
 
+def _note_instagram_cooldown(kind: str) -> None:
+    """Remember a rate-limit so the next requests do not poke Instagram again."""
+    if kind != "rate_limit":
+        return
+    global _ig_cooldown_until
+    with _ig_cooldown_lock:
+        _ig_cooldown_until = time.monotonic() + IG_RATE_LIMIT_COOLDOWN_SECONDS
+    logger.warning(
+        "Instagram rate-limited this session; pausing API calls for %.0fs",
+        IG_RATE_LIMIT_COOLDOWN_SECONDS,
+    )
+
+
+def _instagram_cooldown_error() -> DownloadError | None:
+    with _ig_cooldown_lock:
+        remaining = _ig_cooldown_until - time.monotonic()
+    if remaining <= 0:
+        return None
+    logger.info("Skipping Instagram API call; rate-limit cooldown has %.0fs left", remaining)
+    return DownloadError(
+        _IG_USER_MESSAGES["rate_limit"],
+        retry_session=False,
+        kind="rate_limit",
+    )
+
+
 def _raise_instagram_block(
     blob: str,
     status_code: int | None = None,
@@ -267,6 +305,10 @@ def _raise_instagram_block(
         return
     if fatal_only and kind not in {"checkpoint", "rate_limit", "login"}:
         return
+    snippet = " ".join((blob or "").split())[:240]
+    if "sessionid=" not in snippet.lower():
+        logger.warning("Instagram %s (HTTP %s): %s", kind, status_code, snippet)
+    _note_instagram_cooldown(kind)
     raise DownloadError(
         _instagram_user_message(kind, resource),
         retry_session=kind in _RETRY_SESSION_KINDS,
@@ -290,6 +332,7 @@ def _map_instagram_exception(exc: BaseException, resource: str = "media") -> Dow
     blob = _exc_blob(exc)
     kind = _classify_instagram_error(blob)
     if kind:
+        _note_instagram_cooldown(kind)
         return DownloadError(
             _instagram_user_message(kind, resource),
             retry_session=kind in _RETRY_SESSION_KINDS,
@@ -520,6 +563,7 @@ def get_thread_safe_loader() -> tuple[instaloader.Instaloader, str | None]:
     if ig_user and session_path and session_path.exists():
         try:
             loader.load_session_from_file(ig_user, str(session_path))
+            loader.context._session.headers["User-Agent"] = IG_WEB_USER_AGENT
             logger.info(
                 "Thread %s using session file: %s (mtime=%s)",
                 threading.get_ident(),
@@ -612,6 +656,9 @@ def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) ->
 
 
 def download_post_sync(shortcode: str, target_dir: str) -> None:
+    cooled = _instagram_cooldown_error()
+    if cooled is not None:
+        raise cooled
     loader, current_user = get_thread_safe_loader()
     try:
         post = instaloader.Post.from_shortcode(loader.context, shortcode)
@@ -692,6 +739,7 @@ def _best_media_url(item: dict[str, Any]) -> tuple[str, str, bool]:
 
 def _web_story_headers(session: Any, asbd_id: str = IG_WEB_ASBD_ID) -> dict[str, Any]:
     headers: dict[str, Any] = {
+        "User-Agent": IG_WEB_USER_AGENT,
         "X-IG-App-ID": IG_WEB_APP_ID,
         "X-ASBD-ID": asbd_id,
         "X-IG-WWW-Claim": "0",
@@ -808,6 +856,9 @@ def _story_rejected(cause: BaseException | None = None) -> DownloadError:
 
 def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[dict[str, Any]]:
     """Fetch one profile's active stories with a single reels_media request."""
+    cooled = _instagram_cooldown_error()
+    if cooled is not None:
+        raise cooled
     _wait_for_story_tray_slot()
     session = loader.context._session
     url = f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}"
