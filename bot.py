@@ -55,35 +55,13 @@ YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS = 1800  # 4K fetch + H.264/H.265 re-encode can 
 TELEGRAM_MEDIA_GROUP_LIMIT = 10
 MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
-# Optional Netscape cookies file for YouTube (needed when guest IP is restricted).
-YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "cookies.txt")
 
-# Instagram web app identifiers. Required for /api/v1/feed/reels_media/
-# (the GraphQL stories query Instaloader still uses is retired).
-# X-ASBD-ID 129477 is what the current web client sends; 359341 makes
-# Instagram answer "please wait a few minutes" even on a fresh session.
-IG_WEB_APP_ID = "936619743392459"
-IG_WEB_ASBD_ID = "129477"
-IG_WEB_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/155.0.8059.40 Safari/537.36"
-)
-# After Instagram rate-limits this login, skip further API calls so retries
-# do not extend the block.
-IG_RATE_LIMIT_COOLDOWN_SECONDS = float(os.environ.get("IG_RATE_LIMIT_COOLDOWN_SECONDS", "600"))
+# Netscape cookies files
+YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "cookies.txt")
+IG_COOKIES_FILE = os.environ.get("IG_COOKIES_FILE", "instagram_cookies.txt")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_PATH = Path(os.environ.get("USER_ID_CACHE_PATH", str(SCRIPT_DIR / "user_id_cache.json")))
-# One profile story response is shared by later users. Files stay until the
-# story expires; a story id that was not in the last response is fetched again.
-STORY_CACHE_DIR = Path(os.environ.get("STORY_CACHE_DIR", str(SCRIPT_DIR / "story_cache")))
-STORY_CACHE_URL_TTL_SECONDS = float(os.environ.get("STORY_CACHE_URL_TTL_SECONDS", "900"))
-STORY_CACHE_PROFILE_TTL_SECONDS = float(os.environ.get("STORY_CACHE_PROFILE_TTL_SECONDS", "900"))
-STORY_CACHE_NEGATIVE_SECONDS = float(os.environ.get("STORY_CACHE_NEGATIVE_SECONDS", "20"))
-STORY_CACHE_EMPTY_SECONDS = float(os.environ.get("STORY_CACHE_EMPTY_SECONDS", "20"))
-# Gap between story-tray listings. Cached trays do not wait.
-STORY_TRAY_MIN_INTERVAL_SECONDS = float(os.environ.get("STORY_TRAY_MIN_INTERVAL_SECONDS", "20"))
 
 # Match Instagram URLs
 INSTAGRAM_HOST_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am)/", re.I)
@@ -104,11 +82,6 @@ _tls = threading.local()
 _global_download_sema: asyncio.Semaphore | None = None
 _slot_lock: asyncio.Lock | None = None
 
-_story_tray_lock = threading.Lock()
-_story_tray_next_at = 0.0
-_ig_cooldown_lock = threading.Lock()
-_ig_cooldown_until = 0.0
-
 
 class DownloadError(Exception):
     """User-facing download failure."""
@@ -119,26 +92,10 @@ class DownloadError(Exception):
         self.kind = kind
 
 
-# Instagram / YouTube error kinds that should skip extra endpoint hammering.
-_SESSION_BLOCK_KINDS = frozenset({"checkpoint", "rate_limit", "login", "restricted"})
-_RETRY_SESSION_KINDS = _SESSION_BLOCK_KINDS | {"private", "generic", "no_stories"}
-
 _IG_USER_MESSAGES = {
-    "checkpoint": (
-        "Instagram blocked this account (security checkpoint / bot check). "
-        "Open Instagram in a browser, complete the verification, then try again later."
-    ),
-    "rate_limit": (
-        "Instagram is temporarily rate-limiting this account. "
-        "Please wait a few minutes and try again."
-    ),
     "login": (
-        "The Instagram session expired or was logged out. "
-        "Please refresh the session file and try again."
-    ),
-    "restricted": (
-        "Instagram refused this request. The content may be private, "
-        "or this session is restricted."
+        "Instagram rejected the session. "
+        "Please update instagram_cookies.txt with fresh Netscape cookies from your browser."
     ),
     "not_found": "That Instagram link was not found. It may have been deleted.",
     "private": "This account is private, and the current Instagram session cannot access it.",
@@ -172,215 +129,6 @@ def _exc_blob(exc: BaseException | str | None) -> str:
     return " ".join(parts)
 
 
-def _classify_instagram_error(blob: str, status_code: int | None = None) -> str | None:
-    text = (blob or "").lower()
-    if status_code == 429 or any(
-        token in text
-        for token in (
-            "too many requests",
-            "rate limit",
-            "rate_limit",
-            "please wait a few minutes",
-            "spam",
-            "action blocked",
-        )
-    ):
-        return "rate_limit"
-    if any(
-        token in text
-        for token in (
-            "checkpoint_required",
-            "challenge_required",
-            "feedback_required",
-            "consent_required",
-            "we suspect automated",
-            "suspicious activity",
-        )
-    ):
-        return "checkpoint"
-    if any(
-        token in text
-        for token in (
-            "login_required",
-            "not logged in",
-            "loginrequired",
-            "session expired",
-            "user is not logged in",
-        )
-    ):
-        return "login"
-    if "privateprofilenotfollowed" in text or "is private" in text:
-        return "private"
-    if any(
-        token in text
-        for token in (
-            "profilenotexists",
-            "queryreturnednotfound",
-            "http 404",
-            "status_code=404",
-            "does not exist",
-        )
-    ) or ("not found" in text and "tray" not in text):
-        return "not_found"
-    if status_code in {401, 403} or any(
-        token in text
-        for token in (
-            "queryreturnedforbidden",
-            "http 403",
-            "status_code=403",
-            "forbidden",
-            "not authorized",
-        )
-    ):
-        return "restricted"
-    if status_code == 400 and ("fail" in text or "bad request" in text or "queryreturnedbadrequest" in text):
-        # GraphQL "fail" without a more specific code is usually a blocked/restricted session.
-        return "restricted"
-    return None
-
-
-def _payload_error_blob(payload: Any) -> str:
-    if not isinstance(payload, dict):
-        return str(payload or "")
-    parts = [
-        str(payload.get("message") or ""),
-        str(payload.get("error_type") or ""),
-        str(payload.get("error_title") or ""),
-        str(payload.get("status") or ""),
-    ]
-    if payload.get("require_login"):
-        parts.append("login_required")
-    spam = payload.get("spam")
-    if spam:
-        parts.append("spam")
-    return " ".join(parts)
-
-
-def _instagram_user_message(kind: str, resource: str = "media") -> str:
-    if kind == "not_found":
-        if resource == "story":
-            return _IG_USER_MESSAGES["expired_story"]
-        if resource == "post":
-            return "That post or reel was not found. It may have been deleted."
-    if kind == "no_stories":
-        return _IG_USER_MESSAGES["no_stories"]
-    return _IG_USER_MESSAGES.get(kind, _IG_USER_MESSAGES["generic"])
-
-
-def _note_instagram_cooldown(kind: str) -> None:
-    """Remember a rate-limit so the next requests do not poke Instagram again."""
-    if kind != "rate_limit":
-        return
-    global _ig_cooldown_until
-    with _ig_cooldown_lock:
-        _ig_cooldown_until = time.monotonic() + IG_RATE_LIMIT_COOLDOWN_SECONDS
-    logger.warning(
-        "Instagram rate-limited this session; pausing API calls for %.0fs",
-        IG_RATE_LIMIT_COOLDOWN_SECONDS,
-    )
-
-
-def _instagram_cooldown_error() -> DownloadError | None:
-    with _ig_cooldown_lock:
-        remaining = _ig_cooldown_until - time.monotonic()
-    if remaining <= 0:
-        return None
-    logger.info("Skipping Instagram API call; rate-limit cooldown has %.0fs left", remaining)
-    return DownloadError(
-        _IG_USER_MESSAGES["rate_limit"],
-        retry_session=False,
-        kind="rate_limit",
-    )
-
-
-def _raise_instagram_block(
-    blob: str,
-    status_code: int | None = None,
-    resource: str = "media",
-    *,
-    fatal_only: bool = False,
-) -> None:
-    kind = _classify_instagram_error(blob, status_code)
-    if not kind:
-        return
-    if fatal_only and kind not in {"checkpoint", "rate_limit", "login"}:
-        return
-    snippet = " ".join((blob or "").split())[:240]
-    if "sessionid=" not in snippet.lower():
-        logger.warning("Instagram %s (HTTP %s): %s", kind, status_code, snippet)
-    _note_instagram_cooldown(kind)
-    raise DownloadError(
-        _instagram_user_message(kind, resource),
-        retry_session=kind in _RETRY_SESSION_KINDS,
-        kind=kind,
-    )
-
-
-def _map_instagram_exception(exc: BaseException, resource: str = "media") -> DownloadError:
-    if isinstance(exc, DownloadError):
-        if exc.kind != "generic" or exc.retry_session:
-            return exc
-        kind = _classify_instagram_error(_exc_blob(exc)) or exc.kind
-        if kind != exc.kind:
-            return DownloadError(
-                _instagram_user_message(kind, resource),
-                retry_session=kind in _RETRY_SESSION_KINDS,
-                kind=kind,
-            )
-        return exc
-
-    blob = _exc_blob(exc)
-    kind = _classify_instagram_error(blob)
-    if kind:
-        _note_instagram_cooldown(kind)
-        return DownloadError(
-            _instagram_user_message(kind, resource),
-            retry_session=kind in _RETRY_SESSION_KINDS,
-            kind=kind,
-        )
-
-    fallback = {
-        "post": "Could not download that post or reel. Please try again later.",
-        "story": "Could not download that story. Please try again later.",
-        "profile": "Could not look up that Instagram account. Please try again later.",
-    }.get(resource, _IG_USER_MESSAGES["generic"])
-    return DownloadError(fallback, retry_session=True, kind="generic")
-
-
-def _map_youtube_exception(exc: BaseException) -> DownloadError:
-    if isinstance(exc, DownloadError):
-        return exc
-    text = _exc_blob(exc).lower()
-    if any(
-        token in text
-        for token in (
-            "sign in to confirm",
-            "not a bot",
-            "confirm you’re not a bot",
-            "confirm you're not a bot",
-        )
-    ):
-        kind = "bot_check"
-    elif "429" in text or "too many requests" in text:
-        kind = "rate_limit"
-    elif "age-restricted" in text or "age restricted" in text:
-        kind = "age"
-    elif any(
-        token in text
-        for token in (
-            "private video",
-            "video unavailable",
-            "this video is not available",
-            "removed by the uploader",
-            "copyright",
-        )
-    ):
-        kind = "unavailable"
-    else:
-        kind = "generic"
-    return DownloadError(_YT_USER_MESSAGES[kind], kind=kind)
-
-
 def log_failed_account(account_name: str, error_msg: str):
     """Appends failed target accounts or sessions to a dedicated log file."""
     try:
@@ -395,12 +143,12 @@ def _normalize_username(username: str) -> str:
 
 
 def get_available_session_files() -> list[Path]:
-    """Find all ig_session_* files next to bot.py (same folder as convert.py)."""
+    """Find all ig_session_* files next to bot.py."""
     return sorted(SCRIPT_DIR.glob("ig_session_*"))
 
 
 def get_session_file() -> tuple[str, Path] | tuple[None, None]:
-    """Use the first ig_session_* file. Extra session files are ignored."""
+    """Use the first ig_session_* file."""
     session_files = get_available_session_files()
     if not session_files:
         return None, None
@@ -408,20 +156,6 @@ def get_session_file() -> tuple[str, Path] | tuple[None, None]:
     selected_file = session_files[0]
     username = selected_file.name.replace("ig_session_", "", 1)
     return username, selected_file
-
-
-def _wait_for_story_tray_slot() -> None:
-    """Reserve the next story listing so profiles are not fetched back to back."""
-    global _story_tray_next_at
-    wait = 0.0
-    with _story_tray_lock:
-        now = time.monotonic()
-        if now < _story_tray_next_at:
-            wait = _story_tray_next_at - now
-        _story_tray_next_at = max(now, _story_tray_next_at) + STORY_TRAY_MIN_INTERVAL_SECONDS
-    if wait:
-        logger.info("Waiting %.1fs before the next story listing", wait)
-        time.sleep(wait)
 
 
 def load_user_id_cache() -> None:
@@ -452,12 +186,6 @@ def save_user_id_cache() -> None:
         logger.warning("Could not persist user ID cache: %s", exc)
 
 
-def cache_get(username: str) -> int | None:
-    key = _normalize_username(username)
-    with _cache_lock:
-        return _user_id_cache.get(key)
-
-
 def cache_set(username: str, user_id: int) -> None:
     key = _normalize_username(username)
     with _cache_lock:
@@ -465,70 +193,8 @@ def cache_set(username: str, user_id: int) -> None:
     save_user_id_cache()
 
 
-def cache_delete(username: str) -> None:
-    key = _normalize_username(username)
-    with _cache_lock:
-        _user_id_cache.pop(key, None)
-    save_user_id_cache()
-
-
-def get_user_id_from_public_html(username: str) -> int | None:
-    """Scrape profile_id from public HTML, optionally attaching session cookies."""
-    url = f"https://www.instagram.com/{username}/"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Mode": "navigate",
-    }
-
-    loader, _ = get_thread_safe_loader()
-    if loader and loader.context._session.cookies:
-        try:
-            session_cookies = loader.context._session.cookies
-            cookie_str = "; ".join([f"{c.name}={c.value}" for c in session_cookies])
-            headers["Cookie"] = cookie_str
-        except Exception as err:
-            logger.debug("Could not attach session cookies to HTML request: %s", err)
-
-    req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=12) as response:
-            html = response.read().decode("utf-8", errors="replace")
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        logger.warning("HTML fallback request failed for @%s: %s", username, exc)
-        return None
-
-    patterns = [
-        r'\\"profile_id\\":\\"(\d+)\\"',
-        r'"profile_id":"(\d+)"',
-        r'"container_id":"(\d+)"',
-        r'"user_id":"(\d+)"',
-        r'profilePage_(\d+)',
-        r'instagram://user\?username=[^"]+?&id=(\d+)',
-        r'"owner":\{"id":"(\d+)"',
-        r'"id":"(\d+)","username":"' + re.escape(username) + r'"',
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, html)
-        if match:
-            extracted_id = int(match.group(1))
-            logger.info("Successfully scraped user ID %s for @%s from HTML", extracted_id, username)
-            return extracted_id
-
-    logger.warning("HTML fallback fetched page for @%s, but no valid profile ID pattern matched.", username)
-    return None
-
-
 def get_thread_safe_loader() -> tuple[instaloader.Instaloader, str | None]:
-    """Return this thread's Instaloader, bound to the single session file.
-
-    Reloads from disk when the session file path or mtime changes so a fresh
-    convert.py login is picked up without requiring a full process restart.
-    """
+    """Return Instaloader instance bound to session file (used for posts/reels)."""
     ig_user, session_path = get_session_file()
     session_mtime: float | None = None
     if session_path is not None and session_path.exists():
@@ -557,27 +223,15 @@ def get_thread_safe_loader() -> tuple[instaloader.Instaloader, str | None]:
         save_metadata=False,
         compress_json=False,
         max_connection_attempts=2,
-        request_timeout=60.0
+        request_timeout=60.0,
     )
 
     if ig_user and session_path and session_path.exists():
         try:
             loader.load_session_from_file(ig_user, str(session_path))
-            loader.context._session.headers["User-Agent"] = IG_WEB_USER_AGENT
-            logger.info(
-                "Thread %s using session file: %s (mtime=%s)",
-                threading.get_ident(),
-                session_path.name,
-                session_mtime,
-            )
         except (OSError, instaloader.exceptions.InstaloaderException) as exc:
             logger.error("Failed to load session file %s: %s", session_path, exc)
             ig_user = None
-    else:
-        logger.warning(
-            "No ig_session_* file found in %s; Instagram requests will be anonymous",
-            SCRIPT_DIR,
-        )
 
     _tls.loader = loader
     _tls.current_username = ig_user
@@ -599,859 +253,71 @@ def _friendly_filename(name: str) -> str:
     return name
 
 
-def get_user_id_from_web_api(loader: instaloader.Instaloader, username: str) -> int | None:
-    """Resolve a profile id via the logged-in web_profile_info endpoint."""
-    session = loader.context._session
-    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-    try:
-        resp = session.get(url, headers=_web_story_headers(session), timeout=30)
-        if resp.status_code != 200:
-            logger.warning("web_profile_info for @%s returned HTTP %s", username, resp.status_code)
-            return None
-        user = ((resp.json() or {}).get("data") or {}).get("user") or {}
-        raw_id = user.get("id") or user.get("pk")
-        if raw_id is not None and str(raw_id).isdigit():
-            logger.info("Resolved @%s to %s via web_profile_info", username, raw_id)
-            return int(raw_id)
-    except Exception as exc:
-        logger.warning("web_profile_info failed for @%s: %s", username, exc)
-    return None
-
-
-def resolve_instagram_user_id(loader: instaloader.Instaloader, username: str) -> int:
-    username = _normalize_username(username)
-
-    cached = cache_get(username)
-    if cached is not None:
-        logger.info("Cache hit for @%s (ID %s)", username, cached)
-        return cached
-
-    logger.info("Cache miss for @%s; attempting resolution", username)
-
-    user_id = get_user_id_from_web_api(loader, username)
-    if user_id:
-        cache_set(username, user_id)
-        return user_id
-
-    user_id = get_user_id_from_public_html(username)
-    if user_id:
-        cache_set(username, user_id)
-        return user_id
-
-    try:
-        logger.info("HTML lookup failed for @%s; trying Instaloader API", username)
-        profile = instaloader.Profile.from_username(loader.context, username)
-        cache_set(username, profile.userid)
-        return profile.userid
-    except Exception as exc:
-        logger.error("Failed to resolve user ID for @%s: %s", username, exc)
-        mapped = _map_instagram_exception(exc, "profile")
-        if mapped.kind in _SESSION_BLOCK_KINDS:
-            raise mapped from exc
-        raise DownloadError(
-            f"Could not find Instagram user @{username}. "
-            "The username may be wrong, or an admin can set the ID with /setid.",
-            kind="not_found",
-        ) from exc
-
-
 def download_post_sync(shortcode: str, target_dir: str) -> None:
-    cooled = _instagram_cooldown_error()
-    if cooled is not None:
-        raise cooled
     loader, current_user = get_thread_safe_loader()
     try:
         post = instaloader.Post.from_shortcode(loader.context, shortcode)
         loader.download_post(post, target=Path(target_dir))
     except Exception as exc:
-        mapped = _map_instagram_exception(exc, "post")
-        logger.warning(
-            "Post %s failed with session '%s' [%s]: %s",
-            shortcode,
-            current_user,
-            mapped.kind,
-            exc,
-        )
+        logger.warning("Post %s failed with session '%s': %s", shortcode, current_user, exc)
         log_failed_account(f"post_{shortcode}", str(exc))
-        raise mapped from exc
+        raise DownloadError(_IG_USER_MESSAGES["generic"], kind="generic") from exc
 
 
-def _story_item_matches(item: Any, media_id: str | None) -> bool:
-    if not media_id:
-        return True
-    raw = str(getattr(item, "mediaid", "") or item)
-    pk = raw.split("_")[0]
-    return pk == media_id or raw == media_id or raw.startswith(media_id) or media_id.startswith(pk)
-
-
-def _reel_item_id(item: dict[str, Any]) -> str:
-    raw = str(item.get("pk") or item.get("id") or "")
-    return raw.split("_")[0]
-
-
-def _reel_item_matches(item: dict[str, Any], media_id: str | None) -> bool:
-    if not media_id:
-        return True
-    item_id = _reel_item_id(item)
-    raw = str(item.get("pk") or item.get("id") or "")
-    return item_id == media_id or raw == media_id or raw.startswith(media_id) or media_id.startswith(item_id)
-
-
-def _best_media_url(item: dict[str, Any]) -> tuple[str, str, bool]:
-    """Return (url, extension, is_video) at the highest available resolution."""
-    versions = item.get("video_versions") or []
-    is_video = int(item.get("media_type") or 0) == 2 or bool(versions) or bool(item.get("video_url"))
-    if is_video:
-        if not isinstance(versions, list):
-            versions = []
-        versions = sorted(
-            [v for v in versions if isinstance(v, dict)],
-            key=lambda v: (int(v.get("width") or 0), int(v.get("height") or 0)),
-            reverse=True,
-        )
-        for version in versions:
-            url = version.get("url")
-            if url:
-                return url, ".mp4", True
-        direct = item.get("video_url")
-        if direct:
-            return direct, ".mp4", True
-        raise DownloadError("Story video is missing a downloadable URL.")
-
-    image_versions = item.get("image_versions2") or {}
-    candidates = image_versions.get("candidates") if isinstance(image_versions, dict) else []
-    if not isinstance(candidates, list):
-        candidates = []
-    candidates = sorted(
-        [c for c in candidates if isinstance(c, dict)],
-        key=lambda c: (int(c.get("width") or 0), int(c.get("height") or 0)),
-        reverse=True,
-    )
-    for candidate in candidates:
-        url = candidate.get("url")
-        if url:
-            return url, ".jpg", False
-    direct = item.get("display_url") or item.get("display_uri")
-    if direct:
-        return direct, ".jpg", False
-    raise DownloadError("Story photo is missing a downloadable URL.")
-
-
-def _web_story_headers(session: Any, asbd_id: str = IG_WEB_ASBD_ID) -> dict[str, Any]:
-    headers: dict[str, Any] = {
-        "User-Agent": IG_WEB_USER_AGENT,
-        "X-IG-App-ID": IG_WEB_APP_ID,
-        "X-ASBD-ID": asbd_id,
-        "X-IG-WWW-Claim": "0",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://www.instagram.com/",
-        "Accept": "*/*",
-        "Origin": "https://www.instagram.com",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        # Instaloader pins Content-Length: 0 on the session. requests drops a
-        # session header when the per-request value is None.
-        "Content-Length": None,
-    }
-    try:
-        csrf = session.cookies.get("csrftoken")
-    except Exception:
-        csrf = None
-    if csrf:
-        headers["X-CSRFToken"] = csrf
-    return headers
-
-
-def _remember_www_claim(headers: dict[str, Any], response: Any) -> bool:
-    try:
-        claim = response.headers.get("x-ig-set-www-claim")
-    except Exception:
-        claim = None
-    if claim and claim != headers.get("X-IG-WWW-Claim"):
-        headers["X-IG-WWW-Claim"] = claim
-        return True
-    return False
-
-
-def _find_reel(data: Any, user_id: int) -> dict[str, Any] | None:
-    if not isinstance(data, dict):
-        return None
-
-    reel = None
-    reels = data.get("reels")
-    if isinstance(reels, dict):
-        reel = reels.get(str(user_id)) or reels.get(user_id)
-        if reel is None:
-            for value in reels.values():
-                if isinstance(value, dict) and str(value.get("id") or value.get("pk") or "") == str(user_id):
-                    reel = value
-                    break
-    if not reel:
-        for media in data.get("reels_media") or []:
-            if not isinstance(media, dict):
-                continue
-            rid = str(media.get("id") or media.get("pk") or "")
-            owner = str((media.get("user") or {}).get("pk") or (media.get("user") or {}).get("id") or "")
-            if rid == str(user_id) or owner == str(user_id):
-                reel = media
-                break
-    if not reel and isinstance(data.get("reel"), dict):
-        reel = data["reel"]
-    return reel if isinstance(reel, dict) else None
-
-
-def _parse_reels_payload(data: Any, user_id: int) -> list[dict[str, Any]]:
-    reel = _find_reel(data, user_id)
-    if not reel:
-        return []
-    items = reel.get("items") or []
-    return [item for item in items if isinstance(item, dict)]
-
-
-def _inspect_story_response(resp: Any, resource: str = "story") -> None:
-    """Abort this session immediately on checkpoint / rate-limit / login blocks."""
-    status = getattr(resp, "status_code", None)
-    payload = None
-    try:
-        payload = resp.json()
-    except Exception:
-        payload = None
-    blob_parts = [_payload_error_blob(payload)]
-    text_attr = getattr(resp, "text", None)
-    if isinstance(text_attr, str):
-        blob_parts.append(text_attr[:2000])
-    _raise_instagram_block(" ".join(blob_parts), status, resource, fatal_only=True)
-
-
-def _story_api_get(session: Any, url: str, headers: dict[str, Any], user_id: int) -> Any:
-    """GET a stories endpoint, then retry once if Instagram issues a www-claim."""
-    # Cap each attempt so a stalled Instagram socket cannot pin a worker thread.
-    resp = session.get(url, headers=headers, timeout=30)
-    if getattr(resp, "status_code", 200) != 200:
-        _inspect_story_response(resp)
-    claim_changed = _remember_www_claim(headers, resp)
-    if resp.status_code != 200 or not claim_changed:
-        return resp
-    try:
-        payload = resp.json()
-    except ValueError:
-        payload = None
-    if _parse_reels_payload(payload, user_id):
-        return resp
-    logger.info("Retrying %s after Instagram set X-IG-WWW-Claim", url)
-    return session.get(url, headers=headers, timeout=30)
-
-
-def _story_rejected(cause: BaseException | None = None) -> DownloadError:
-    error = DownloadError(
-        "Could not download those stories. Instagram rejected the request.",
-        retry_session=False,
-        kind="generic",
-    )
-    if cause is not None:
-        raise error from cause
-    return error
-
-
-def _fetch_reels_media(loader: instaloader.Instaloader, user_id: int) -> list[dict[str, Any]]:
-    """Fetch one profile's active stories with a single reels_media request."""
-    cooled = _instagram_cooldown_error()
-    if cooled is not None:
-        raise cooled
-    _wait_for_story_tray_slot()
-    session = loader.context._session
-    url = f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}"
-    headers = _web_story_headers(session)
-    try:
-        resp = _story_api_get(session, url, headers, user_id)
-    except DownloadError:
-        raise
-    except Exception as exc:
-        mapped = _map_instagram_exception(exc, "story")
-        if mapped.kind in _SESSION_BLOCK_KINDS:
-            raise mapped from exc
-        _story_rejected(exc)
-
-    if resp.status_code != 200:
-        _inspect_story_response(resp)
-        blob = getattr(resp, "text", None)
-        _raise_instagram_block(blob if isinstance(blob, str) else "", resp.status_code, "story")
-        raise _story_rejected()
-
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        _story_rejected(exc)
-
-    _raise_instagram_block(
-        _payload_error_blob(payload), resp.status_code, "story", fatal_only=True
-    )
-    items = _parse_reels_payload(payload, user_id)
-    if items:
-        logger.info("Fetched %s story item(s) for user %s", len(items), user_id)
-        return items
-    if _find_reel(payload, user_id) is not None:
-        logger.info("Stories tray empty for user %s", user_id)
-        return []
-    raise _story_rejected()
-
-
-def _write_http_body(response: Any, dest: Path) -> None:
-    with dest.open("wb") as handle:
-        while True:
-            chunk = response.read(256 * 1024)
-            if not chunk:
-                break
-            handle.write(chunk)
-
-
-def _cookie_header(session: Any) -> str:
-    try:
-        pairs = [f"{cookie.name}={cookie.value}" for cookie in session.cookies]
-    except Exception:
-        return ""
-    return "; ".join(pairs)
-
-
-def _download_story_file(session: Any, url: str, dest: Path) -> None:
-    """Download a signed story URL.
-
-    The CDN returns 403 when the request uses Instaloader's session headers
-    (Chrome user-agent, Content-Length: 0, API cookies). A bare Mozilla/5.0
-    user-agent with no cookies is what currently works.
-    """
-    anon_headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        with urlopen(Request(url, headers=anon_headers), timeout=120) as response:
-            _write_http_body(response, dest)
-            return
-    except HTTPError as exc:
-        if exc.code not in (401, 403):
-            raise DownloadError(
-                "Could not download that story file. Please try again later.",
-                kind="generic",
-            ) from exc
-        logger.warning("Anonymous story download got HTTP %s; retrying with session cookies", exc.code)
-    except (URLError, TimeoutError, OSError) as exc:
-        logger.warning("Anonymous story download failed (%s); retrying with session cookies", exc)
-
-    headers = dict(anon_headers)
-    cookie_header = _cookie_header(session)
-    if cookie_header:
-        headers["Cookie"] = cookie_header
-    try:
-        with urlopen(Request(url, headers=headers), timeout=120) as response:
-            _write_http_body(response, dest)
-    except HTTPError as exc:
+def download_story_yt_dlp_sync(username: str, media_id: str | None, target_dir: str) -> None:
+    """Download Instagram stories using yt-dlp and instagram_cookies.txt."""
+    cookies_path = Path(IG_COOKIES_FILE)
+    if not cookies_path.is_file():
         raise DownloadError(
-            "Could not download that story file. Please try again later.",
-            kind="generic",
-        ) from exc
-
-
-def _file_is_error_page(path: Path) -> bool:
-    try:
-        with path.open("rb") as handle:
-            head = handle.read(32).lstrip().lower()
-    except OSError:
-        return True
-    return head.startswith((b"<!doctype", b"<html", b"<head", b"{"))
-
-
-def _save_story_item(
-    session: Any,
-    item: dict[str, Any],
-    username: str,
-    target_dir: str,
-) -> Path:
-    media_url, suffix, is_video = _best_media_url(item)
-    taken_at = int(item.get("taken_at") or item.get("taken_at_timestamp") or 0)
-    if taken_at:
-        date_str = datetime.fromtimestamp(taken_at, tz=timezone.utc).strftime("%Y-%m-%d")
-    else:
-        date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-    media_id = _reel_item_id(item) or uuid.uuid4().hex[:12]
-    # Keep Instaloader's typename tokens so Telegram captions still parse as
-    # #{YYYYMMDD} #{username}IGS after splitting on underscores.
-    kind = "GraphStoryVideo" if is_video else "GraphStoryImage"
-    filename = f"{date_str}_{username}_{kind}_{media_id}{suffix}"
-    dest = Path(target_dir) / filename
-    _download_story_file(session, media_url, dest)
-    time.sleep(0.5)
-    if dest.stat().st_size == 0 or _file_is_error_page(dest):
-        dest.unlink(missing_ok=True)
-        raise DownloadError(f"Downloaded empty or invalid file for story {media_id}.")
-    logger.info("Saved story %s (%s bytes)", dest.name, dest.stat().st_size)
-    return dest
-
-
-def _tray_has_requested_story(items: list[dict[str, Any]], media_id: str | None) -> bool:
-    if not items:
-        return False
-    if not media_id:
-        return True
-    return any(_reel_item_matches(item, media_id) for item in items)
-
-
-def _load_story_items(
-    loader: instaloader.Instaloader,
-    username: str,
-    media_id: str | None,
-) -> list[dict[str, Any]]:
-    cached_before = cache_get(username)
-    user_id = resolve_instagram_user_id(loader, username)
-    try:
-        items = _fetch_reels_media(loader, user_id)
-    except DownloadError as exc:
-        if exc.kind in _SESSION_BLOCK_KINDS or cached_before is None:
-            raise
-        logger.info("Story request failed for cached id %s; resolving @%s again", cached_before, username)
-        cache_delete(username)
-        try:
-            refreshed_id = resolve_instagram_user_id(loader, username)
-        except DownloadError:
-            raise exc
-        if refreshed_id == user_id:
-            raise exc
-        return _fetch_reels_media(loader, refreshed_id)
-
-    # Whole-profile requests (no story id) accept an empty tray as a real answer.
-    # Only a missing concrete story id can mean the cached user id is stale.
-    if media_id is None or _tray_has_requested_story(items, media_id) or cached_before is None:
-        return items
-
-    logger.info(
-        "Cached id %s did not contain the requested story; resolving @%s again",
-        cached_before,
-        username,
-    )
-    cache_delete(username)
-    try:
-        refreshed_id = resolve_instagram_user_id(loader, username)
-    except DownloadError:
-        return items
-    if refreshed_id == user_id:
-        return items
-    return _fetch_reels_media(loader, refreshed_id)
-
-
-def _story_cache_key(media_id: str | None) -> str | None:
-    if not media_id:
-        return None
-    return str(media_id).split("_", 1)[0]
-
-
-def _story_expiry(item: dict[str, Any], now: float) -> float:
-    raw = item.get("expiring_at") or item.get("expiring_at_timestamp") or 0
-    try:
-        expiring = float(raw)
-    except (TypeError, ValueError):
-        expiring = 0
-    if expiring > 10**12:
-        expiring /= 1000
-    if expiring > 0:
-        return expiring
-    taken = item.get("taken_at") or item.get("taken_at_timestamp") or now
-    try:
-        expiring = float(taken)
-    except (TypeError, ValueError):
-        expiring = now
-    if expiring > 10**12:
-        expiring /= 1000
-    return expiring + 86400
-
-
-class _Flight:
-    def __init__(self) -> None:
-        self.event = threading.Event()
-        self.value: Any = None
-        self.error: BaseException | None = None
-
-
-class ProfileStoryCache:
-    """Share one profile story tray, and the files saved from it, across users."""
-
-    def __init__(self) -> None:
-        self.root = STORY_CACHE_DIR
-        self.files = self.root / "files"
-        self.index_path = self.root / "index.json"
-        self.url_ttl = STORY_CACHE_URL_TTL_SECONDS
-        self.profile_ttl = STORY_CACHE_PROFILE_TTL_SECONDS
-        self.negative_seconds = STORY_CACHE_NEGATIVE_SECONDS
-        self.empty_seconds = STORY_CACHE_EMPTY_SECONDS
-        self._lock = threading.Lock()
-        self._trays: dict[str, dict[str, Any]] = {}
-        self._missing_until: dict[tuple[str, str], float] = {}
-        self._tray_flights: dict[str, _Flight] = {}
-        self._file_flights: dict[tuple[str, str], _Flight] = {}
-        self._load()
-
-    def resolve(
-        self,
-        username: str,
-        media_id: str | None,
-        fetch,
-    ) -> list[dict[str, Any]]:
-        """Return the cached tray, or let one caller fetch it for everyone waiting."""
-        username = _normalize_username(username)
-        media_id = _story_cache_key(media_id)
-        with self._lock:
-            self._prune_locked()
-            hit = self._hit_locked(username, media_id)
-            if hit is not None:
-                return hit
-            flight = self._tray_flights.get(username)
-            owner = flight is None
-            if owner:
-                flight = _Flight()
-                self._tray_flights[username] = flight
-
-        if not owner:
-            assert flight is not None
-            logger.info("story tray join in-flight @%s story=%s", username, media_id or "*")
-            return self._wait_flight(flight, "Story request timed out. Please try again.")
-
-        logger.info("story tray fetch @%s story=%s", username, media_id or "*")
-        try:
-            items = fetch(username, media_id)
-            with self._lock:
-                self._store_locked(username, items, media_id)
-                stored = self._item_dicts_locked(username)
-            assert flight is not None
-            flight.value = stored
-            return stored
-        except Exception as exc:
-            assert flight is not None
-            flight.error = exc
-            raise
-        finally:
-            assert flight is not None
-            flight.event.set()
-            with self._lock:
-                if self._tray_flights.get(username) is flight:
-                    self._tray_flights.pop(username, None)
-
-    def deliver(self, username: str, item: dict[str, Any], target_dir: str) -> Path:
-        """Copy a saved story file, or download it once and share that file."""
-        username = _normalize_username(username)
-        story_id = _reel_item_id(item)
-        with self._lock:
-            ready = self._ready_path_locked(username, story_id)
-            if ready is not None:
-                logger.info("story file cache hit @%s/%s", username, story_id)
-            else:
-                ready = None
-                key = (username, story_id)
-                flight = self._file_flights.get(key)
-                owner = flight is None
-                if owner:
-                    flight = _Flight()
-                    self._file_flights[key] = flight
-        if ready is not None:
-            return _copy_into(ready, target_dir)
-
-        if not owner:
-            assert flight is not None
-            logger.info("story file join in-flight @%s/%s", username, story_id)
-            saved = self._wait_flight(flight, "Story download timed out. Please try again.")
-            return _copy_into(saved, target_dir)
-
-        try:
-            loader, current_user = get_thread_safe_loader()
-            if not current_user:
-                raise DownloadError(
-                    "Stories need a logged-in Instagram session. "
-                    "Place an ig_session_<username> file next to the bot, then try again.",
-                    kind="login",
-                )
-            saved = _save_story_item(loader.context._session, item, username, target_dir)
-            permanent = self._adopt(saved)
-            with self._lock:
-                entry = self._trays.get(username, {}).get("items", {}).get(story_id)
-                if entry is not None:
-                    entry["path"] = str(permanent)
-                    self._save_locked()
-            assert flight is not None
-            flight.value = permanent
-            return saved
-        except Exception as exc:
-            assert flight is not None
-            flight.error = exc
-            raise
-        finally:
-            assert flight is not None
-            flight.event.set()
-            with self._lock:
-                if self._file_flights.get((username, story_id)) is flight:
-                    self._file_flights.pop((username, story_id), None)
-
-    def invalidate_urls(self, username: str) -> None:
-        """Force the next lookup to ask Instagram for fresh media URLs."""
-        username = _normalize_username(username)
-        with self._lock:
-            tray = self._trays.get(username)
-            if tray is not None:
-                tray["fetched_at"] = 0
-            stale = [key for key in self._missing_until if key[0] == username]
-            for key in stale:
-                self._missing_until.pop(key, None)
-
-    def _wait_flight(self, flight: _Flight, timeout_message: str) -> Any:
-        if not flight.event.wait(DOWNLOAD_TIMEOUT_SECONDS):
-            raise DownloadError(timeout_message, kind="generic")
-        if flight.error is not None:
-            raise flight.error
-        if flight.value is None:
-            raise DownloadError(_IG_USER_MESSAGES["generic"], retry_session=True, kind="generic")
-        return flight.value
-
-    def _hit_locked(self, username: str, media_id: str | None) -> list[dict[str, Any]] | None:
-        now = time.time()
-        if media_id and self._missing_until.get((username, media_id), 0) >= now:
-            logger.info("story cache still missing @%s/%s", username, media_id)
-            raise DownloadError(_IG_USER_MESSAGES["expired_story"], kind="expired_story")
-        tray = self._trays.get(username)
-        if tray is None:
-            return None
-        items: dict[str, dict[str, Any]] = tray["items"]
-        if media_id:
-            entry = items.get(media_id)
-            if entry is not None and self._entry_usable(tray, entry, now):
-                logger.info("story cache hit @%s/%s", username, media_id)
-                return self._item_dicts_locked(username)
-            return None
-        ttl = self.profile_ttl if items else self.empty_seconds
-        if now - float(tray["fetched_at"]) <= ttl:
-            logger.info("story cache hit @%s/*", username)
-            return self._item_dicts_locked(username)
-        return None
-
-    def _entry_usable(self, tray: dict[str, Any], entry: dict[str, Any], now: float) -> bool:
-        if float(entry["expiring_at"]) <= now:
-            return False
-        path = entry.get("path")
-        if path and Path(path).is_file():
-            return True
-        return now - float(tray["fetched_at"]) <= self.url_ttl
-
-    def _item_dicts_locked(self, username: str) -> list[dict[str, Any]]:
-        tray = self._trays.get(username) or {}
-        return [entry["item"] for entry in tray.get("items", {}).values()]
-
-    def _ready_path_locked(self, username: str, story_id: str) -> Path | None:
-        entry = self._trays.get(username, {}).get("items", {}).get(story_id)
-        if not entry or float(entry["expiring_at"]) <= time.time():
-            return None
-        path = entry.get("path")
-        if path and Path(path).is_file():
-            return Path(path)
-        return None
-
-    def _store_locked(
-        self,
-        username: str,
-        items: list[dict[str, Any]],
-        requested_id: str | None,
-    ) -> None:
-        now = time.time()
-        previous = self._trays.get(username, {}).get("items", {})
-        stored: dict[str, dict[str, Any]] = {}
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            story_id = _reel_item_id(item)
-            if not story_id:
-                continue
-            expiring = _story_expiry(item, now)
-            if expiring <= now:
-                continue
-            old = previous.get(story_id) or {}
-            old_path = old.get("path")
-            path = old_path if old_path and Path(old_path).is_file() else None
-            stored[story_id] = {"item": item, "path": path, "expiring_at": expiring}
-            self._missing_until.pop((username, story_id), None)
-        self._trays[username] = {"fetched_at": now, "items": stored}
-        if requested_id and requested_id not in stored and self.negative_seconds > 0:
-            self._missing_until[(username, requested_id)] = now + self.negative_seconds
-        self._save_locked()
-
-    def _adopt(self, src: Path) -> Path:
-        self.files.mkdir(parents=True, exist_ok=True)
-        dest = self.files / src.name
-        if src.resolve() != dest.resolve():
-            shutil.copy2(src, dest)
-        return dest
-
-    def _prune_locked(self) -> None:
-        now = time.time()
-        for username in list(self._trays):
-            tray = self._trays[username]
-            for story_id in list(tray["items"]):
-                entry = tray["items"][story_id]
-                if float(entry["expiring_at"]) > now:
-                    if entry.get("path") and not Path(entry["path"]).is_file():
-                        entry["path"] = None
-                    continue
-                path = entry.get("path")
-                if path:
-                    Path(path).unlink(missing_ok=True)
-                del tray["items"][story_id]
-            if not tray["items"] and now - float(tray["fetched_at"]) > self.empty_seconds:
-                self._trays.pop(username, None)
-        for key, until in list(self._missing_until.items()):
-            if until < now:
-                self._missing_until.pop(key, None)
-
-    def _load(self) -> None:
-        if not self.index_path.is_file():
-            return
-        try:
-            payload = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            logger.warning("Could not load story cache: %s", exc)
-            return
-        now = time.time()
-        for username, raw_tray in (payload.get("trays") or {}).items():
-            if not isinstance(raw_tray, dict):
-                continue
-            items: dict[str, dict[str, Any]] = {}
-            for story_id, raw in (raw_tray.get("items") or {}).items():
-                if not isinstance(raw, dict) or not isinstance(raw.get("item"), dict):
-                    continue
-                expiring = float(raw.get("expiring_at") or 0)
-                if expiring <= now:
-                    continue
-                file_name = raw.get("file")
-                path = None
-                if file_name:
-                    candidate = self.files / Path(str(file_name)).name
-                    if candidate.is_file():
-                        path = str(candidate)
-                items[str(story_id)] = {
-                    "item": raw["item"],
-                    "path": path,
-                    "expiring_at": expiring,
-                }
-            fetched_at = float(raw_tray.get("fetched_at") or 0)
-            if not items and now - fetched_at > self.empty_seconds:
-                continue
-            self._trays[_normalize_username(str(username))] = {
-                "fetched_at": fetched_at,
-                "items": items,
-            }
-        if self._trays:
-            logger.info("Loaded story cache for %s profile(s)", len(self._trays))
-
-    def _save_locked(self) -> None:
-        trays: dict[str, Any] = {}
-        for username, tray in self._trays.items():
-            items: dict[str, Any] = {}
-            for story_id, entry in tray["items"].items():
-                body: dict[str, Any] = {
-                    "expiring_at": entry["expiring_at"],
-                    "item": entry["item"],
-                }
-                path = entry.get("path")
-                if path and Path(path).is_file():
-                    body["file"] = Path(path).name
-                items[story_id] = body
-            trays[username] = {"fetched_at": tray["fetched_at"], "items": items}
-        try:
-            self.root.mkdir(parents=True, exist_ok=True)
-            blob = json.dumps({"version": 1, "trays": trays})
-            tmp = self.index_path.with_suffix(".json.tmp")
-            tmp.write_text(blob, encoding="utf-8")
-            tmp.replace(self.index_path)
-        except (OSError, TypeError, ValueError) as exc:
-            logger.warning("Could not persist story cache: %s", exc)
-
-
-def _copy_into(src: Path, target_dir: str) -> Path:
-    dest = Path(target_dir) / src.name
-    if dest.resolve() != src.resolve():
-        shutil.copy2(src, dest)
-    return dest
-
-
-STORY_TRAY = ProfileStoryCache()
-
-
-def _fetch_story_tray(username: str, media_id: str | None) -> list[dict[str, Any]]:
-    """Ask Instagram once for every active story on one session."""
-    username = _normalize_username(username)
-    loader, current_user = get_thread_safe_loader()
-    if not current_user:
-        raise DownloadError(
-            "Stories need a logged-in Instagram session. "
-            "Place an ig_session_<username> file next to the bot, then try again.",
+            f"Missing {IG_COOKIES_FILE}. Please export your Instagram browser cookies "
+            "in Netscape format and place them in the bot directory.",
             kind="login",
         )
-    try:
-        return _load_story_items(loader, username, media_id)
-    except Exception as exc:
-        mapped = _map_instagram_exception(exc, "story")
-        logger.warning(
-            "Story @%s failed with session '%s' [%s]: %s",
-            username,
-            current_user,
-            mapped.kind,
-            exc,
-        )
-        if mapped.kind == "no_stories":
-            return []
-        raise mapped from exc
 
-
-def _serve_story_request(
-    username: str,
-    media_id: str | None,
-    target_dir: str,
-    *,
-    allow_refresh: bool = True,
-) -> None:
-    items = STORY_TRAY.resolve(username, media_id, _fetch_story_tray)
-    matched = [item for item in items if _reel_item_matches(item, media_id)]
-    if not matched:
-        if media_id:
-            logger.info(
-                "Requested story %s not in tray for @%s (have %s)",
-                media_id,
-                username,
-                ", ".join(_reel_item_id(item) for item in items[:8]) or "none",
-            )
-            raise DownloadError(_IG_USER_MESSAGES["expired_story"], kind="expired_story")
-        raise DownloadError(_IG_USER_MESSAGES["no_stories"], kind="no_stories")
-
-    logger.info(
-        "Serving %s story item(s) for @%s (story=%s)",
-        len(matched),
-        username,
-        media_id or "*",
-    )
-    for item in matched:
-        try:
-            STORY_TRAY.deliver(username, item, target_dir)
-        except DownloadError as exc:
-            if allow_refresh and exc.kind == "generic":
-                logger.info("Refreshing story URLs for @%s after a failed file download", username)
-                STORY_TRAY.invalidate_urls(username)
-                _serve_story_request(username, media_id, target_dir, allow_refresh=False)
-                return
-            raise
-        if media_id:
-            return
-
-
-def download_story_sync(username: str, media_id: str | None, target_dir: str) -> None:
     username = _normalize_username(username)
+    if media_id:
+        url = f"https://www.instagram.com/stories/{username}/{media_id}/"
+    else:
+        url = f"https://www.instagram.com/stories/{username}/"
+
+    outtmpl = os.path.join(target_dir, "%(upload_date)s_%(uploader)s_GraphStory_%(id)s.%(ext)s")
+
+    opts: dict[str, Any] = {
+        "outtmpl": outtmpl,
+        "cookiefile": str(cookies_path),
+        "quiet": True,
+        "no_warnings": True,
+        "restrictfilenames": True,
+        "retries": 3,
+    }
+
+    logger.info("Downloading Instagram story via yt-dlp for @%s (url=%s)", username, url)
+
     try:
-        _serve_story_request(username, media_id, target_dir)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
     except Exception as exc:
-        mapped = _map_instagram_exception(exc, "story")
-        logger.warning("Story @%s failed [%s]: %s", username, mapped.kind, exc)
+        logger.error("yt-dlp story download failed for @%s: %s", username, exc)
+        blob = _exc_blob(exc).lower()
+        if any(token in blob for token in ("login", "cookie", "redirect", "403", "401")):
+            raise DownloadError(
+                "Instagram rejected the cookies. Please export a fresh instagram_cookies.txt "
+                "file from a logged-in browser.",
+                kind="login",
+            ) from exc
         log_failed_account(username, str(exc))
-        raise mapped from exc
+        raise DownloadError(
+            f"No active stories found or could not download stories for @{username}.",
+            kind="no_stories",
+        ) from exc
+
+    downloaded_files = [
+        p
+        for p in Path(target_dir).iterdir()
+        if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES and p.stat().st_size > 0
+    ]
+    if not downloaded_files:
+        raise DownloadError(_IG_USER_MESSAGES["no_stories"], kind="no_stories")
 
 
 def clean_youtube_url(url: str) -> str:
@@ -1467,7 +333,6 @@ def clean_youtube_url(url: str) -> str:
         video_id = query.get("v")
         if video_id:
             return f"https://www.youtube.com/watch?v={video_id[0]}"
-        # youtu.be/<id> or /shorts/<id> /embed/<id>
         parts = [p for p in parsed.path.split("/") if p]
         if host == "youtu.be" and parts:
             return f"https://www.youtube.com/watch?v={parts[0][:11]}"
@@ -1511,96 +376,6 @@ def _ffprobe_streams(path: Path) -> list[dict[str, Any]]:
     return [s for s in streams if isinstance(s, dict)]
 
 
-def _video_encoder_args(height: int) -> list[str]:
-    """Pick H.265 for 1440p+ (smaller 4K), otherwise H.264. Prefer VideoToolbox on macOS."""
-    want_hevc = height >= 1440
-    if platform.system() == "Darwin":
-        if want_hevc:
-            # hvc1 tag improves playback on Apple devices / Telegram clients.
-            return ["-c:v", "hevc_videotoolbox", "-q:v", "45", "-tag:v", "hvc1"]
-        return ["-c:v", "h264_videotoolbox", "-q:v", "45"]
-    if want_hevc:
-        return ["-c:v", "libx265", "-preset", "fast", "-crf", "22", "-tag:v", "hvc1"]
-    return ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]
-
-
-def _ensure_mp4_h26x(src: Path) -> Path:
-    """Ensure the file is MP4 with H.264/H.265 video and AAC audio."""
-    streams = _ffprobe_streams(src)
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
-    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
-    if not video:
-        raise DownloadError(f"Downloaded file has no video stream: {src.name}")
-
-    vcodec = str(video.get("codec_name") or "").lower()
-    acodec = str(audio.get("codec_name") or "").lower() if audio else ""
-    height = int(video.get("height") or 0)
-    already_ok = src.suffix.lower() == ".mp4" and vcodec in {"h264", "hevc", "h265"} and (
-        not audio or acodec in {"aac", "mp3"}
-    )
-    if already_ok:
-        return src
-
-    dest = src.with_suffix(".mp4")
-    if dest.resolve() == src.resolve():
-        dest = src.with_name(f"{src.stem}.converted.mp4")
-
-    # Remux-only when codecs are already compatible with MP4.
-    if vcodec in {"h264", "hevc", "h265"} and (not audio or acodec in {"aac", "mp3"}):
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(src),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(dest),
-        ]
-        logger.info("Remuxing %s -> %s (vcodec=%s acodec=%s)", src.name, dest.name, vcodec, acodec)
-    else:
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(src),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            *_video_encoder_args(height),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-            str(dest),
-        ]
-        logger.info(
-            "Re-encoding %s -> %s (src vcodec=%s height=%s)",
-            src.name,
-            dest.name,
-            vcodec,
-            height,
-        )
-
-    result = _run_cmd(cmd, timeout=YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS)
-    if result.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
-        err = (result.stderr or result.stdout or "").strip().splitlines()
-        tail = err[-8:] if err else ["unknown ffmpeg error"]
-        raise DownloadError("Failed to convert video to MP4 (H.264/H.265): " + " | ".join(tail))
-
-    if dest.resolve() != src.resolve() and src.exists():
-        src.unlink(missing_ok=True)
-    return dest
-
-
 def _yt_base_opts(target_dir: str) -> dict[str, Any]:
     outtmpl = os.path.join(target_dir, "%(title).180B [%(id)s].%(ext)s")
     opts: dict[str, Any] = {
@@ -1612,9 +387,6 @@ def _yt_base_opts(target_dir: str) -> dict[str, Any]:
         "retries": 5,
         "fragment_retries": 5,
         "concurrent_fragment_downloads": 4,
-        # Use yt-dlp's default YouTube client set. Forcing ios/android/tv-only
-        # commonly collapses formats down to a single ~360p progressive stream
-        # (e.g. 640x272), which is exactly the failure mode we hit.
     }
     cookies_path = Path(YTDLP_COOKIES_FILE)
     if cookies_path.is_file():
@@ -1623,241 +395,22 @@ def _yt_base_opts(target_dir: str) -> dict[str, Any]:
     return opts
 
 
-def _format_pixels(fmt: dict[str, Any]) -> int:
-    return int(fmt.get("width") or 0) * int(fmt.get("height") or 0)
-
-
-def _is_video_only(fmt: dict[str, Any]) -> bool:
-    vcodec = fmt.get("vcodec")
-    acodec = fmt.get("acodec")
-    return bool(vcodec and vcodec != "none" and (not acodec or acodec == "none"))
-
-
-def _is_audio_only(fmt: dict[str, Any]) -> bool:
-    vcodec = fmt.get("vcodec")
-    acodec = fmt.get("acodec")
-    return bool(acodec and acodec != "none" and (not vcodec or vcodec == "none"))
-
-
-def _is_progressive(fmt: dict[str, Any]) -> bool:
-    vcodec = fmt.get("vcodec")
-    acodec = fmt.get("acodec")
-    return bool(vcodec and vcodec != "none" and acodec and acodec != "none")
-
-
-def _within_4k_cap(fmt: dict[str, Any]) -> bool:
-    """Allow up to 4K, including ultrawide 3840xN masters."""
-    width = int(fmt.get("width") or 0)
-    height = int(fmt.get("height") or 0)
-    if width <= 0 and height <= 0:
-        return False
-    return width <= 4096 and height <= 2160
-
-
-def _protocol_rank(fmt: dict[str, Any]) -> int:
-    """Prefer plain https DASH over HLS when quality is equal."""
-    proto = str(fmt.get("protocol") or "")
-    if proto.startswith("https"):
-        return 2
-    if "m3u8" in proto:
-        return 1
-    return 0
-
-
-def _pick_youtube_format_ids(formats: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
-    """Pick best video (<=4K) + best audio by pixel count / bitrate.
-
-    Returns (format_selector, chosen_video_format).
-    """
-    usable = [f for f in formats if isinstance(f, dict) and f.get("format_id")]
-    videos = [f for f in usable if _is_video_only(f) and _within_4k_cap(f)]
-    audios = [f for f in usable if _is_audio_only(f)]
-    progressive = [f for f in usable if _is_progressive(f) and _within_4k_cap(f)]
-
-    # Prefer formats that already have a direct/manifest URL (skip SABR-only stubs).
-    def _has_download_url(fmt: dict[str, Any]) -> bool:
-        return bool(fmt.get("url") or fmt.get("manifest_url") or fmt.get("fragments"))
-
-    videos_ready = [f for f in videos if _has_download_url(f)] or videos
-    audios_ready = [f for f in audios if _has_download_url(f)] or audios
-    progressive_ready = [f for f in progressive if _has_download_url(f)] or progressive
-    videos, audios, progressive = videos_ready, audios_ready, progressive_ready
-
-    best_video = None
-    if videos:
-        best_video = max(
-            videos,
-            key=lambda f: (
-                _format_pixels(f),
-                _protocol_rank(f),
-                float(f.get("tbr") or f.get("vbr") or 0),
-                float(f.get("fps") or 0),
-            ),
-        )
-    best_audio = None
-    if audios:
-        best_audio = max(
-            audios,
-            key=lambda f: (
-                float(f.get("abr") or f.get("tbr") or 0),
-                _protocol_rank(f),
-            ),
-        )
-
-    best_prog = None
-    if progressive:
-        best_prog = max(
-            progressive,
-            key=lambda f: (
-                _format_pixels(f),
-                float(f.get("tbr") or 0),
-                _protocol_rank(f),
-            ),
-        )
-
-    if best_video and best_audio:
-        selector = f"{best_video['format_id']}+{best_audio['format_id']}"
-        logger.info(
-            "Selected YouTube formats %s (%sx%s %s) + %s (%s)",
-            best_video.get("format_id"),
-            best_video.get("width"),
-            best_video.get("height"),
-            best_video.get("vcodec"),
-            best_audio.get("format_id"),
-            best_audio.get("acodec"),
-        )
-        return selector, best_video
-
-    if best_prog:
-        logger.info(
-            "Selected progressive YouTube format %s (%sx%s)",
-            best_prog.get("format_id"),
-            best_prog.get("width"),
-            best_prog.get("height"),
-        )
-        return str(best_prog["format_id"]), best_prog
-
-    if best_video:
-        # Last resort: video only (should not happen if audio exists).
-        return str(best_video["format_id"]), best_video
-
-    raise DownloadError("No downloadable YouTube formats were returned for that video.")
-
-
 def download_youtube_sync(url: str, target_dir: str) -> None:
-    """Download best available video up to 4K with audio, then convert to H.264/H.265 MP4.
-
-    Manually picks formats by pixel count so ultrawide 4K (e.g. 3840x1634) is preferred
-    over the low-res progressive fallback (often 640x272) that ios/android clients return.
-    """
     cleaned_url = clean_youtube_url(url)
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         raise DownloadError("ffmpeg/ffprobe is required for YouTube downloads. Please install ffmpeg.")
 
     base_opts = _yt_base_opts(target_dir)
-    chosen_video: dict[str, Any] | None = None
-    selector = ""
+    download_opts = dict(base_opts)
+    download_opts["format"] = "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
+    download_opts["merge_output_format"] = "mkv"
 
     try:
-        probe_opts = dict(base_opts)
-        probe_opts["skip_download"] = True
-        with yt_dlp.YoutubeDL(probe_opts) as ydl:
-            info = ydl.extract_info(cleaned_url, download=False)
-            if info is None:
-                raise DownloadError("yt-dlp returned no video information.")
-            if info.get("entries"):
-                entries = [e for e in info["entries"] if e]
-                if not entries:
-                    raise DownloadError("No downloadable video found at that URL.")
-                info = entries[0]
-            formats = info.get("formats") or []
-            selector, chosen_video = _pick_youtube_format_ids(formats)
-
-        expected_pixels = _format_pixels(chosen_video)
-        if expected_pixels and expected_pixels < 640 * 360:
-            # Only low-res formats were advertised — usually means the extractor
-            # fell back to a restricted client. Cookies often unlock higher formats.
-            hint = ""
-            if not Path(YTDLP_COOKIES_FILE).is_file():
-                hint = (
-                    " Place a Netscape cookies.txt (export from a logged-in browser) "
-                    f"next to the bot as {YTDLP_COOKIES_FILE}, then retry."
-                )
-            raise DownloadError(
-                f"YouTube only offered low resolution "
-                f"({chosen_video.get('width')}x{chosen_video.get('height')})."
-                f"{hint}"
-            )
-
-        download_opts = dict(base_opts)
-        download_opts.update(
-            {
-                "format": selector,
-                "merge_output_format": "mkv",
-            }
-        )
         with yt_dlp.YoutubeDL(download_opts) as ydl:
-            info = ydl.extract_info(cleaned_url, download=True)
-            if info is None:
-                raise DownloadError("yt-dlp returned no video information.")
-            if info.get("entries"):
-                entries = [e for e in info["entries"] if e]
-                info = entries[0]
-            requested = ydl.prepare_filename(info)
-            candidates = [
-                Path(requested),
-                Path(requested).with_suffix(".mkv"),
-                Path(requested).with_suffix(".mp4"),
-                Path(requested).with_suffix(".webm"),
-            ]
-    except DownloadError:
-        raise
+            ydl.download([cleaned_url])
     except Exception as exc:
         logger.error("yt-dlp download failed for %s: %s", cleaned_url, exc)
-        raise _map_youtube_exception(exc) from exc
-
-    downloaded: Path | None = None
-    for candidate in candidates:
-        if candidate.is_file() and candidate.stat().st_size > 0:
-            downloaded = candidate
-            break
-    if downloaded is None:
-        videos = [
-            p
-            for p in Path(target_dir).iterdir()
-            if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES and p.stat().st_size > 0
-        ]
-        if not videos:
-            raise DownloadError("YouTube download finished but no video file was found.")
-        downloaded = max(videos, key=lambda p: p.stat().st_mtime)
-
-    width = height = 0
-    for stream in _ffprobe_streams(downloaded):
-        if stream.get("codec_type") == "video":
-            width = int(stream.get("width") or 0)
-            height = int(stream.get("height") or 0)
-            break
-    logger.info(
-        "Downloaded YouTube file %s (%s bytes, %sx%s)",
-        downloaded.name,
-        downloaded.stat().st_size,
-        width or "?",
-        height or "?",
-    )
-
-    if chosen_video and expected_pixels:
-        actual_pixels = width * height
-        # Guard against silently ending up with the 360p progressive fallback.
-        if actual_pixels and actual_pixels < max(expected_pixels * 0.5, 1):
-            raise DownloadError(
-                f"Downloaded resolution {width}x{height} is much lower than the "
-                f"selected {chosen_video.get('width')}x{chosen_video.get('height')}. "
-                "Try updating yt-dlp or providing cookies.txt."
-            )
-
-    # Re-encode to H.264/H.265 is skipped for testing. The merged file
-    # (typically MKV, original codecs + audio) is uploaded as-is.
-    logger.info("Skipping re-encode for testing; keeping %s", downloaded.name)
+        raise DownloadError(_YT_USER_MESSAGES["generic"], kind="generic") from exc
 
 
 def _flatten_target_directory(target_dir: str) -> list[Path]:
@@ -1909,10 +462,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     await update.message.reply_text(
         "Welcome to the Media Downloader Bot.\n\n"
-        "Send an Instagram link (post, reel, story, IGTV) or YouTube link.\n"
-        "Story links can be a specific story id, or just the profile "
-        "(https://www.instagram.com/stories/username/) to grab every active story.\n"
-        "YouTube downloads up to 4K with audio and converts to MP4 (H.264/H.265).",
+        "Send an Instagram link (post, reel, story) or YouTube link.\n"
+        "Story links require an instagram_cookies.txt file placed next to the bot.",
     )
 
 
@@ -1977,7 +528,6 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await message.reply_text(str(exc))
             return
         if story_target is None and STORY_RE.search(text):
-            # Highlight URLs and other non-profile story paths.
             await message.reply_text(
                 "Cannot download highlights from that URL. "
                 "Send the user's main story link instead "
@@ -2010,10 +560,7 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         async with sema:
             if is_youtube:
                 yt_url = clean_youtube_url(is_youtube.group(0))
-                await _safe_edit(
-                    status_msg,
-                    "Downloading YouTube (up to 4K + audio) and converting to MP4…",
-                )
+                await _safe_edit(status_msg, "Downloading YouTube video…")
                 await asyncio.wait_for(
                     asyncio.to_thread(download_youtube_sync, yt_url, target_dir),
                     timeout=YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS,
@@ -2027,17 +574,13 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             elif story_target:
                 username, media_id = story_target
                 if media_id:
-                    await _safe_edit(
-                        status_msg,
-                        f"Downloading story {media_id} from @{username}…",
-                    )
+                    await _safe_edit(status_msg, f"Downloading story {media_id} from @{username}…")
                 else:
-                    await _safe_edit(
-                        status_msg,
-                        f"Downloading all active stories for @{username}…",
-                    )
+                    await _safe_edit(status_msg, f"Downloading active stories for @{username}…")
+                
+                # Using yt-dlp with instagram_cookies.txt
                 await asyncio.wait_for(
-                    asyncio.to_thread(download_story_sync, username, media_id, target_dir),
+                    asyncio.to_thread(download_story_yt_dlp_sync, username, media_id, target_dir),
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
                 )
 
@@ -2046,9 +589,7 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         entries = _flatten_target_directory(target_dir)
 
         if not entries:
-            raise DownloadError(
-                "No media was downloaded. It may be private, deleted, or no longer available."
-            )
+            raise DownloadError("No media was downloaded. It may be private, deleted, or no longer available.")
 
         await _safe_edit(status_msg, f"Uploading {len(entries)} file(s) to Telegram…")
 
@@ -2056,32 +597,28 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             media_group: list[InputMediaDocument] = []
             for i, path in enumerate(entries):
                 handle = stack.enter_context(path.open("rb"))
-                
+
                 caption = None
                 if i == len(entries) - 1 and is_instagram:
-                    parts = path.name.split('_')
-                    # Ensure it has enough parts to safely extract date, user, type, and ID
-                    if len(parts) >= 4 and parts[0].count('-') == 2:
-                        date_str = parts[0].replace('-', '')
-                        
-                        # Reconstruct usernames that contain underscores (e.g., 6y_day)
-                        # Everything between the date (index 0) and the typename (index -2) is the username
+                    parts = path.name.split("_")
+                    if len(parts) >= 4 and parts[0].count("-") == 2:
+                        date_str = parts[0].replace("-", "")
                         ig_user = "_".join(parts[1:-2])
-                        
+
                         if story_match:
                             ig_type = "IGS"
                         elif post_match and "/reel/" in text.lower():
                             ig_type = "IGReels"
                         else:
                             ig_type = "IG"
-                            
+
                         caption = f"#{date_str} #{ig_user}{ig_type}"
 
                 media_group.append(
                     InputMediaDocument(
-                        media=handle, 
+                        media=handle,
                         filename=_friendly_filename(path.name),
-                        caption=caption
+                        caption=caption,
                     )
                 )
 
@@ -2096,10 +633,7 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except asyncio.TimeoutError:
         logger.warning("Timeout for user %s in %s", user_id, target_dir)
-        await _safe_edit(
-            status_msg,
-            "Download timed out. Please try again — large videos can take a while.",
-        )
+        await _safe_edit(status_msg, "Download timed out. Please try again.")
     except DownloadError as exc:
         logger.error("Download error for user %s [%s]: %s", user_id, getattr(exc, "kind", "generic"), exc)
         await _safe_edit(status_msg, str(exc))
@@ -2117,13 +651,9 @@ async def _post_init(application: Application) -> None:
     _slot_lock = asyncio.Lock()
     load_user_id_cache()
 
-    sessions = get_available_session_files()
-    logger.info("Detected %d session file(s): %s", len(sessions), [s.name for s in sessions])
-    if len(sessions) > 1:
-        logger.info("Using %s only; extra session files are ignored", sessions[0].name)
+    if not Path(IG_COOKIES_FILE).is_file():
+        logger.warning("Notice: %s not found. Story downloads will fail until added.", IG_COOKIES_FILE)
 
-    if not ADMIN_TELEGRAM_IDS:
-        logger.warning("ADMIN_TELEGRAM_IDS is empty; /setid is disabled for everyone.")
     logger.info("Bot is ready.")
 
 
