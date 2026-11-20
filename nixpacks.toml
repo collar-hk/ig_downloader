@@ -3,3 +3,6 @@ providers = ['python', 'node']
 
 [pkgs]
 pkgs = ['ffmpeg', 'nodejs']
+
+[start]
+cmd = 'python bot.py'

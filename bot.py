@@ -34,7 +34,9 @@ from telegram.ext import (
 from ig_media import (
     LoginRequired,
     build_instagram_session,
+    classify_instagram,
     dedupe_media_files,
+    expand_instagram_text,
     fetch_html,
     parse_html_payloads,
     post_assets_from_payloads,
@@ -42,7 +44,6 @@ from ig_media import (
     session_has_login,
     story_assets_from_payloads,
 )
-from story_cache import StoryUnavailable, parse_story_target
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -69,10 +70,8 @@ IG_COOKIES_FILE = os.environ.get("IG_COOKIES_FILE", "instagram_cookies.txt")
 SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_PATH = Path(os.environ.get("USER_ID_CACHE_PATH", str(SCRIPT_DIR / "user_id_cache.json")))
 
-# Match Instagram URLs
+# Match Instagram URLs. /reels/ and /share/ are handled in ig_media.classify_instagram.
 INSTAGRAM_HOST_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am)/", re.I)
-POST_RE = re.compile(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", re.I)
-STORY_RE = re.compile(r"/stories/([^/?#&]+)(?:/([^/?#&]+))?", re.I)
 
 # Match YouTube URLs
 YOUTUBE_RE = re.compile(
@@ -569,6 +568,14 @@ def _flatten_target_directory(target_dir: str) -> list[Path]:
     return sorted(unique, key=lambda item: item.name)
 
 
+def _ensure_limits() -> None:
+    global _global_download_sema, _slot_lock
+    if _slot_lock is None:
+        _slot_lock = asyncio.Lock()
+    if _global_download_sema is None:
+        _global_download_sema = asyncio.Semaphore(MAX_GLOBAL_DOWNLOADS)
+
+
 def _task_counts(context: ContextTypes.DEFAULT_TYPE) -> dict[int, int]:
     return context.application.bot_data.setdefault("user_active_tasks", {})
 
@@ -641,40 +648,30 @@ async def setid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await message.reply_text(f"Saved. ID {target_id} is linked to @{username}.")
 
 
-def _safe_edit(status_msg: Any, text: str):
-    return status_msg.edit_text(text)
+async def _safe_edit(status_msg: Any, text: str):
+    text = text[:4000]
+    try:
+        await status_msg.edit_text(text)
+    except Exception as exc:
+        logger.warning("Could not edit status message: %s", exc)
+        try:
+            await status_msg.reply_text(text)
+        except Exception:
+            logger.exception("Could not send a fallback status message")
 
 
 async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
-    if not message or not message.text:
+    message = update.effective_message
+    text = ""
+    if message is not None:
+        text = message.text or message.caption or ""
+    if not message or not text:
         return
-
-    text = message.text
 
     is_instagram = INSTAGRAM_HOST_RE.search(text)
     is_youtube = YOUTUBE_RE.search(text)
 
     if not is_instagram and not is_youtube:
-        return
-
-    post_match = POST_RE.search(text) if is_instagram else None
-    story_target: tuple[str, str | None] | None = None
-    if is_instagram and not post_match:
-        try:
-            story_target = parse_story_target(text)
-        except StoryUnavailable as exc:
-            await message.reply_text(str(exc))
-            return
-        if story_target is None and STORY_RE.search(text):
-            await message.reply_text(
-                "Cannot download highlights from that URL. "
-                "Send the user's main story link instead "
-                "(for example https://www.instagram.com/stories/username/)."
-            )
-            return
-
-    if is_instagram and not post_match and story_target is None:
         return
 
     user = message.from_user
@@ -683,30 +680,76 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = user.id
     chat_id = message.chat_id
 
-    if not await _acquire_user_slot(context, user_id):
-        await message.reply_text("You have too many active downloads. Please wait for them to finish.")
-        return
-
-    target_dir = tempfile.mkdtemp(prefix=f"dl_{uuid.uuid4().hex[:8]}_")
+    # Answer before any network or download work. Unrecognized links used to
+    # return here with no message, which looks like a dead bot.
     status_msg = await message.reply_text("Fetching… this may take a moment.")
-    logger.info("User %s requested download into %s", user_id, target_dir)
+    logger.info("User %s sent a media link", user_id)
 
-    sema = _global_download_sema
-    assert sema is not None
+    if is_instagram and ("/share/" in text.lower()):
+        try:
+            text = await asyncio.to_thread(expand_instagram_text, text)
+        except Exception:
+            logger.exception("Could not expand Instagram share link")
+
+    kind = "youtube"
+    shortcode: str | None = None
+    story_target: tuple[str, str | None] | None = None
+    if is_instagram and not (is_youtube and not INSTAGRAM_HOST_RE.search(text)):
+        try:
+            parsed_kind, first, second = classify_instagram(text)
+        except Exception as exc:
+            logger.exception("Could not read the Instagram link")
+            await _safe_edit(status_msg, f"Could not read that Instagram link. {exc}")
+            return
+        if parsed_kind == "highlight":
+            await _safe_edit(
+                status_msg,
+                "Cannot download highlights from that URL. "
+                "Send the user's main story link instead "
+                "(for example https://www.instagram.com/stories/username/).",
+            )
+            return
+        if parsed_kind == "unknown":
+            await _safe_edit(
+                status_msg,
+                "I couldn't open that Instagram link. Send a post, reel, or story URL.",
+            )
+            return
+        kind = parsed_kind
+        if parsed_kind == "post":
+            shortcode = first
+        elif parsed_kind == "story":
+            story_target = (first or "", second)
+    elif is_youtube:
+        kind = "youtube"
+
+    _ensure_limits()
+    acquired = False
+    target_dir = ""
     story_match = story_target is not None
     failed_items = 0
 
     try:
+        if not await _acquire_user_slot(context, user_id):
+            await _safe_edit(status_msg, "You have too many active downloads. Please wait for them to finish.")
+            return
+        acquired = True
+
+        target_dir = tempfile.mkdtemp(prefix=f"dl_{uuid.uuid4().hex[:8]}_")
+        logger.info("User %s requested download into %s", user_id, target_dir)
+
+        sema = _global_download_sema
+        assert sema is not None
         async with sema:
-            if is_youtube:
+            if kind == "youtube":
+                assert is_youtube is not None
                 yt_url = clean_youtube_url(is_youtube.group(0))
                 await _safe_edit(status_msg, "Downloading YouTube video…")
                 failed_items = await asyncio.wait_for(
                     asyncio.to_thread(download_youtube_sync, yt_url, target_dir),
                     timeout=YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS,
                 )
-            elif post_match:
-                shortcode = post_match.group(1)
+            elif kind == "post" and shortcode:
                 failed_items = await asyncio.wait_for(
                     asyncio.to_thread(download_post_sync, shortcode, target_dir),
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
@@ -746,7 +789,7 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
                         if story_match:
                             ig_type = "IGS"
-                        elif post_match and "/reel/" in text.lower():
+                        elif kind == "post" and "/reel/" in text.lower():
                             ig_type = "IGReels"
                         else:
                             ig_type = "IG"
@@ -780,15 +823,28 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.exception("Unexpected error for user %s", user_id)
         await _safe_edit(status_msg, "Something went wrong while processing that link. Please try again later.")
     finally:
-        await _release_user_slot(context, user_id)
-        shutil.rmtree(target_dir, ignore_errors=True)
+        if acquired:
+            await _release_user_slot(context, user_id)
+        if target_dir:
+            shutil.rmtree(target_dir, ignore_errors=True)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled bot error", exc_info=context.error)
+    message = getattr(update, "effective_message", None) if update else None
+    if message is None:
+        return
+    try:
+        await message.reply_text("Something went wrong while reading that message. Please send the link again.")
+    except Exception:
+        logger.exception("Could not report the handler error")
 
 
 async def _post_init(application: Application) -> None:
-    global _global_download_sema, _slot_lock
-    _global_download_sema = asyncio.Semaphore(MAX_GLOBAL_DOWNLOADS)
-    _slot_lock = asyncio.Lock()
+    _ensure_limits()
     load_user_id_cache()
+    await application.bot.delete_webhook(drop_pending_updates=False)
+    logger.info("Webhook cleared. The bot is polling for messages.")
 
     if not Path(IG_COOKIES_FILE).is_file() and not get_available_session_files():
         logger.warning(
@@ -815,7 +871,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("setid", setid_command))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), media_listener))
+    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, media_listener))
+    app.add_error_handler(on_error)
 
     logger.info("Bot background service is starting…")
     app.run_polling(drop_pending_updates=True)

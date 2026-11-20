@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 
 from ig_media import (
     MediaAsset,
+    classify_instagram,
     dedupe_media_files,
     parse_html_payloads,
     post_assets_from_payloads,
@@ -132,6 +133,32 @@ class ExtractTests(unittest.TestCase):
         from_marker, _expected = post_assets_from_payloads(payloads, "FROMMARKER")
         self.assertEqual(from_js[0].url, "https://cdn.example/a.jpg")
         self.assertEqual(from_marker[0].url, "https://cdn.example/b.jpg")
+
+    def test_classify_reels_share_and_profile_links(self) -> None:
+        self.assertEqual(
+            classify_instagram("https://www.instagram.com/reels/AbC123xyz/"),
+            ("post", "AbC123xyz", None),
+        )
+        self.assertEqual(
+            classify_instagram("https://www.instagram.com/reel/AbC123xyz/?igsh=abc"),
+            ("post", "AbC123xyz", None),
+        )
+        self.assertEqual(
+            classify_instagram("https://www.instagram.com/share/p/BAGsharetoken/"),
+            ("unknown", None, None),
+        )
+        self.assertEqual(
+            classify_instagram("https://www.instagram.com/stories/Ada/9988/"),
+            ("story", "Ada", "9988"),
+        )
+        self.assertEqual(
+            classify_instagram("https://www.instagram.com/some.user/?igsh=1"),
+            ("story", "some.user", None),
+        )
+        self.assertEqual(
+            classify_instagram("https://www.instagram.com/stories/highlights/99/"),
+            ("highlight", None, None),
+        )
 
     def test_parse_story_target(self) -> None:
         self.assertEqual(
