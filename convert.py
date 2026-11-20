@@ -1,49 +1,107 @@
-import http.cookiejar
+"""Turn instagram_cookies.txt into an Instaloader session file.
+
+Instaloader's login check calls https://www.instagram.com/graphql/query.
+Instagram now redirects that URL to the homepage, and the body is not JSON, so
+the check retries until it is interrupted. The session file is only the browser
+cookies, so this script saves those without calling graphql/query.
+"""
+
+from __future__ import annotations
+
+import os
+import re
 from pathlib import Path
+from urllib.parse import unquote
 
 import instaloader
-import requests.utils
+import requests
 
-USERNAME = "ericpoon2026"
+from ig_media import build_instagram_session, load_netscape_cookies
+
+USERNAME = os.environ.get("IG_USERNAME", "ericpoon2026")
 SCRIPT_DIR = Path(__file__).resolve().parent
 COOKIE_PATH = SCRIPT_DIR / "instagram_cookies.txt"
-L = instaloader.Instaloader()
+_USERNAME_RE = re.compile(r"[A-Za-z0-9._]{1,30}")
+_WEB_FORM_URL = "https://www.instagram.com/api/v1/accounts/edit/web_form_data/"
 
-if not COOKIE_PATH.exists():
-    raise SystemExit(f"Cookie file not found: {COOKIE_PATH}")
 
-# Load Netscape cookies from the same folder as this script.
-cookie_jar = http.cookiejar.MozillaCookieJar(str(COOKIE_PATH))
-cookie_jar.load(ignore_discard=True, ignore_expires=True)
+def _clean_username(value: str | None) -> str | None:
+    if not value:
+        return None
+    name = unquote(value).strip().lstrip("@")
+    if _USERNAME_RE.fullmatch(name):
+        return name
+    return None
 
-# Copy into a Requests cookie jar (what Instaloader expects to save/load).
-L.context._session.cookies.clear()
-for cookie in cookie_jar:
-    L.context._session.cookies.set_cookie(cookie)
 
-# Prefer username from cookies when present; fall back to USERNAME.
-cookie_map = requests.utils.dict_from_cookiejar(L.context._session.cookies)
-ds_user_id = cookie_map.get("ds_user_id")
-L.context.username = USERNAME
+def username_from_cookies(cookie_map: dict[str, str]) -> str | None:
+    return _clean_username(cookie_map.get("ds_user"))
 
-csrf_token = cookie_map.get("csrftoken")
-if csrf_token:
-    L.context._session.headers.update({
-        "X-CSRFToken": csrf_token,
-        "Referer": "https://www.instagram.com/",
-    })
 
-print(f"Reading cookies from: {COOKIE_PATH}")
-if ds_user_id:
-    print(f"Cookie ds_user_id: {ds_user_id}")
-print(f"Cookie sessionid present: {'sessionid' in cookie_map}")
+def username_from_web_form(session: requests.Session) -> str | None:
+    """Ask Instagram for the logged-in username once. Never calls graphql/query."""
+    csrf = session.cookies.get("csrftoken")
+    headers = {
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.instagram.com/accounts/edit/",
+        "Accept": "application/json",
+    }
+    if csrf:
+        headers["X-CSRFToken"] = csrf
+    try:
+        response = session.get(_WEB_FORM_URL, headers=headers, timeout=20, allow_redirects=False)
+    except requests.RequestException as exc:
+        print(f"Could not confirm the username with Instagram: {exc}")
+        return None
+    if response.is_redirect or response.status_code != 200:
+        location = response.headers.get("Location", "")
+        print(
+            "Instagram did not confirm the cookies "
+            f"(HTTP {response.status_code}{f' -> {location}' if location else ''}). "
+            "The session file will still be written from the cookie file."
+        )
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        print("Instagram did not return a username. The session file will still be written from the cookie file.")
+        return None
+    form = payload.get("form_data") if isinstance(payload, dict) else None
+    if isinstance(form, dict):
+        return _clean_username(form.get("username") if isinstance(form.get("username"), str) else None)
+    return None
 
-try:
-    logged_in_user = L.test_login()
-    print(f"Successfully logged in as: {logged_in_user}")
-    ig_name = logged_in_user or USERNAME
-    session_path = SCRIPT_DIR / f"ig_session_{ig_name}"
-    L.save_session_to_file(str(session_path))
+
+def write_session(cookie_path: Path, dest_dir: Path, *, fallback_username: str = USERNAME) -> Path:
+    if not cookie_path.is_file():
+        raise SystemExit(f"Cookie file not found: {cookie_path}")
+
+    browser = build_instagram_session(cookie_path)
+    cookie_map = {cookie.name: cookie.value for cookie in browser.cookies}
+    if not cookie_map.get("sessionid"):
+        raise SystemExit(f"{cookie_path.name} has no sessionid cookie. Export cookies again while logged in.")
+    if not cookie_map.get("csrftoken"):
+        raise SystemExit(f"{cookie_path.name} has no csrftoken cookie. Export cookies again while logged in.")
+
+    username = username_from_cookies(cookie_map) or username_from_web_form(browser) or fallback_username
+    loader = instaloader.Instaloader(max_connection_attempts=1, quiet=True)
+    loader.context._session.cookies.clear()
+    for cookie in load_netscape_cookies(cookie_path):
+        loader.context._session.cookies.set_cookie(cookie)
+    loader.context.username = username
+
+    session_path = dest_dir / f"ig_session_{username}"
+    loader.save_session_to_file(str(session_path))
+    return session_path
+
+
+def main() -> None:
+    print(f"Reading cookies from: {COOKIE_PATH}")
+    session_path = write_session(COOKIE_PATH, SCRIPT_DIR)
     print(f"Session saved to {session_path}")
-except Exception as e:
-    print(f"Error creating session: {e}")
+    print("Skipped Instaloader's graphql/query login check. Instagram redirects that call to the homepage.")
+
+
+if __name__ == "__main__":
+    main()
