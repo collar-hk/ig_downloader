@@ -7,7 +7,6 @@ import asyncio
 import json
 import logging
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -16,16 +15,12 @@ import tempfile
 import threading
 import uuid
 from contextlib import ExitStack
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
-from urllib.request import Request, urlopen
 
 import instaloader
 import yt_dlp
-import time
 from telegram import InputMediaDocument, Update
 from telegram.ext import (
     Application,
@@ -36,6 +31,17 @@ from telegram.ext import (
     filters,
 )
 
+from ig_media import (
+    LoginRequired,
+    build_instagram_session,
+    dedupe_media_files,
+    fetch_html,
+    parse_html_payloads,
+    post_assets_from_payloads,
+    save_assets,
+    session_has_login,
+    story_assets_from_payloads,
+)
 from story_cache import StoryUnavailable, parse_story_target
 
 logging.basicConfig(
@@ -132,10 +138,10 @@ def _exc_blob(exc: BaseException | str | None) -> str:
 def log_failed_account(account_name: str, error_msg: str):
     """Appends failed target accounts or sessions to a dedicated log file."""
     try:
-        with open("failed_accounts.log", "a", encoding="utf-8") as f:
-            f.write(f"Failed Account: {account_name} | Error: {error_msg}\n")
-    except IOError as e:
-        logger.error("Could not write to failed_accounts.log: %s", e)
+        with open("failed_accounts.log", "a", encoding="utf-8") as handle:
+            handle.write(f"Failed Account: {account_name} | Error: {error_msg}\n")
+    except OSError as exc:
+        logger.error("Could not write to failed_accounts.log: %s", exc)
 
 
 def _normalize_username(username: str) -> str:
@@ -166,9 +172,9 @@ def load_user_id_cache() -> None:
         data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             _user_id_cache = {
-                _normalize_username(str(k)): int(v)
-                for k, v in data.items()
-                if str(v).isdigit() or isinstance(v, int)
+                _normalize_username(str(key)): int(value)
+                for key, value in data.items()
+                if str(value).isdigit() or isinstance(value, int)
             }
             logger.info("Loaded %s cached Instagram user IDs", len(_user_id_cache))
     except (OSError, ValueError) as exc:
@@ -253,71 +259,201 @@ def _friendly_filename(name: str) -> str:
     return name
 
 
-def download_post_sync(shortcode: str, target_dir: str) -> None:
-    loader, current_user = get_thread_safe_loader()
+def _instagram_session():
+    """Browser cookies, plus the Instaloader session when one is loaded."""
+    extra = None
+    loader, _ig_user = get_thread_safe_loader()
+    requests_session = getattr(loader.context, "_session", None)
+    if requests_session is not None:
+        extra = list(requests_session.cookies)
+    return build_instagram_session(Path(IG_COOKIES_FILE), extra)
+
+
+def _count_media(target_dir: str) -> int:
+    return sum(1 for path in Path(target_dir).rglob("*") if path.is_file() and path.suffix.lower() in MEDIA_SUFFIXES and path.stat().st_size > 0)
+
+
+def download_post_sync(shortcode: str, target_dir: str) -> int:
+    """Download every slide of a post. Returns how many slides failed."""
+    session = _instagram_session()
+    failures: list[str] = []
+    saved = 0
+    expected = 0
+    page_error: Exception | None = None
+
+    for page_url in (
+        f"https://www.instagram.com/p/{shortcode}/",
+        f"https://www.instagram.com/reel/{shortcode}/",
+    ):
+        try:
+            page_html, _final_url = fetch_html(session, page_url)
+            assets, expected = post_assets_from_payloads(parse_html_payloads(page_html), shortcode)
+        except LoginRequired as exc:
+            page_error = exc
+            continue
+        except Exception as exc:
+            page_error = exc
+            logger.warning("Post page parse failed for %s: %s", shortcode, exc)
+            continue
+        if not assets:
+            continue
+        saved, failures = save_assets(session, assets, target_dir, referer=page_url)
+        logger.info("Post %s: page listed %s slide(s), saved %s", shortcode, expected, saved)
+        if saved and (expected <= saved):
+            return len(failures)
+        break
+
+    # The page listed more slides than it actually embedded, or it embedded none.
+    # Instaloader's post API still returns sidecar children for a logged-in session.
+    if saved == 0 or (expected and saved < expected):
+        try:
+            before = _count_media(target_dir)
+            loader, current_user = get_thread_safe_loader()
+            post = instaloader.Post.from_shortcode(loader.context, shortcode)
+            loader.download_post(post, target=Path(target_dir))
+            after = _count_media(target_dir)
+            logger.info(
+                "Post %s: instaloader added %s file(s) via session '%s'",
+                shortcode,
+                max(after - before, 0),
+                current_user,
+            )
+            saved = after
+        except Exception as exc:
+            logger.warning("Post %s instaloader fallback failed: %s", shortcode, exc)
+            page_error = page_error or exc
+
+    if saved <= 0 and _count_media(target_dir) <= 0:
+        if isinstance(page_error, LoginRequired) or (
+            page_error is not None and "login" in _exc_blob(page_error).lower()
+        ):
+            raise DownloadError(_IG_USER_MESSAGES["login"], kind="login") from page_error
+        log_failed_account(f"post_{shortcode}", str(page_error or "no media"))
+        raise DownloadError(_IG_USER_MESSAGES["generic"], kind="generic")
+    return len(failures)
+
+
+def _download_stories_with_instaloader(username: str, media_id: str | None, target_dir: str) -> int:
+    """GraphQL story items, without the broken mobile reels_media call."""
+    loader, _ig_user = get_thread_safe_loader()
+    if not loader.context.is_logged_in:
+        raise LoginRequired("Instaloader has no session")
+
+    context = loader.context
+    previous_iphone = getattr(context, "iphone_support", True)
+    context.iphone_support = False
+    saved = 0
     try:
-        post = instaloader.Post.from_shortcode(loader.context, shortcode)
-        loader.download_post(post, target=Path(target_dir))
-    except Exception as exc:
-        logger.warning("Post %s failed with session '%s': %s", shortcode, current_user, exc)
-        log_failed_account(f"post_{shortcode}", str(exc))
-        raise DownloadError(_IG_USER_MESSAGES["generic"], kind="generic") from exc
+        profile = instaloader.Profile.from_username(context, username)
+        for story in loader.get_stories(userids=[profile.userid]):
+            for item in story.get_items():
+                if media_id and str(item.mediaid) != str(media_id):
+                    continue
+                try:
+                    if loader.download_storyitem(item, target_dir):
+                        saved += 1
+                except Exception as exc:
+                    logger.warning("Story item %s failed: %s", getattr(item, "mediaid", "?"), exc)
+    finally:
+        context.iphone_support = previous_iphone
+    return saved
 
 
-def download_story_yt_dlp_sync(username: str, media_id: str | None, target_dir: str) -> None:
-    """Download Instagram stories using yt-dlp and instagram_cookies.txt."""
-    cookies_path = Path(IG_COOKIES_FILE)
-    if not cookies_path.is_file():
+def download_story_sync(username: str, media_id: str | None, target_dir: str) -> int:
+    """Download every active story, including photos. Returns how many items failed."""
+    username = _normalize_username(username)
+    if media_id:
+        page_url = f"https://www.instagram.com/stories/{username}/{media_id}/"
+    else:
+        page_url = f"https://www.instagram.com/stories/{username}/"
+
+    session = _instagram_session()
+    if not session_has_login(session):
         raise DownloadError(
             f"Missing {IG_COOKIES_FILE}. Please export your Instagram browser cookies "
             "in Netscape format and place them in the bot directory.",
             kind="login",
         )
 
-    username = _normalize_username(username)
+    failures: list[str] = []
+    saved = 0
+    page_error: Exception | None = None
+    try:
+        page_html, _final_url = fetch_html(session, page_url)
+        assets = story_assets_from_payloads(parse_html_payloads(page_html), username, media_id)
+        if assets:
+            saved, failures = save_assets(session, assets, target_dir, referer=page_url)
+            logger.info("Stories for @%s: page listed %s item(s), saved %s", username, len(assets), saved)
+        else:
+            logger.info("Stories for @%s: story page had no media items", username)
+    except LoginRequired as exc:
+        page_error = exc
+        logger.warning("Story page for @%s requires a fresh login: %s", username, exc)
+    except Exception as exc:
+        page_error = exc
+        logger.warning("Story page parse failed for @%s: %s", username, exc)
+
+    if saved == 0:
+        try:
+            saved = _download_stories_with_instaloader(username, media_id, target_dir)
+            logger.info("Stories for @%s: instaloader saved %s item(s)", username, saved)
+        except instaloader.exceptions.ProfileNotExistsException as exc:
+            raise DownloadError(_IG_USER_MESSAGES["not_found"], kind="not_found") from exc
+        except instaloader.exceptions.PrivateProfileNotFollowedException as exc:
+            raise DownloadError(_IG_USER_MESSAGES["private"], kind="private") from exc
+        except Exception as exc:
+            logger.warning("Instaloader story fallback failed for @%s: %s", username, exc)
+            page_error = page_error or exc
+
+    if saved == 0 and _count_media(target_dir) == 0:
+        try:
+            _download_story_ytdlp(username, media_id, target_dir)
+        except DownloadError:
+            raise
+        except Exception as exc:
+            logger.error("yt-dlp story download failed for @%s: %s", username, exc)
+            page_error = page_error or exc
+
+    if _count_media(target_dir) <= 0:
+        if isinstance(page_error, LoginRequired) or (
+            page_error is not None and any(token in _exc_blob(page_error).lower() for token in ("login", "cookie", "401", "403"))
+        ):
+            raise DownloadError(
+                "Instagram rejected the cookies. Please export a fresh instagram_cookies.txt "
+                "file from a logged-in browser.",
+                kind="login",
+            ) from page_error
+        if media_id:
+            raise DownloadError(_IG_USER_MESSAGES["expired_story"], kind="expired_story")
+        log_failed_account(username, str(page_error or "no stories"))
+        raise DownloadError(_IG_USER_MESSAGES["no_stories"], kind="no_stories")
+    return len(failures)
+
+
+def _download_story_ytdlp(username: str, media_id: str | None, target_dir: str) -> None:
+    """Last resort for video stories. Photo items are not in this result."""
+    cookies_path = Path(IG_COOKIES_FILE)
+    if not cookies_path.is_file():
+        raise DownloadError(_IG_USER_MESSAGES["login"], kind="login")
+
     if media_id:
         url = f"https://www.instagram.com/stories/{username}/{media_id}/"
     else:
         url = f"https://www.instagram.com/stories/{username}/"
 
-    outtmpl = os.path.join(target_dir, "%(upload_date)s_%(uploader)s_GraphStory_%(id)s.%(ext)s")
-
+    outtmpl = os.path.join(target_dir, "%(upload_date)s_%(uploader)s_GraphStoryVideo_%(id)s.%(ext)s")
     opts: dict[str, Any] = {
         "outtmpl": outtmpl,
         "cookiefile": str(cookies_path),
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
+        "ignoreerrors": True,
         "retries": 3,
     }
-
     logger.info("Downloading Instagram story via yt-dlp for @%s (url=%s)", username, url)
-
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception as exc:
-        logger.error("yt-dlp story download failed for @%s: %s", username, exc)
-        blob = _exc_blob(exc).lower()
-        if any(token in blob for token in ("login", "cookie", "redirect", "403", "401")):
-            raise DownloadError(
-                "Instagram rejected the cookies. Please export a fresh instagram_cookies.txt "
-                "file from a logged-in browser.",
-                kind="login",
-            ) from exc
-        log_failed_account(username, str(exc))
-        raise DownloadError(
-            f"No active stories found or could not download stories for @{username}.",
-            kind="no_stories",
-        ) from exc
-
-    downloaded_files = [
-        p
-        for p in Path(target_dir).iterdir()
-        if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES and p.stat().st_size > 0
-    ]
-    if not downloaded_files:
-        raise DownloadError(_IG_USER_MESSAGES["no_stories"], kind="no_stories")
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
 
 
 def clean_youtube_url(url: str) -> str:
@@ -333,7 +469,7 @@ def clean_youtube_url(url: str) -> str:
         video_id = query.get("v")
         if video_id:
             return f"https://www.youtube.com/watch?v={video_id[0]}"
-        parts = [p for p in parsed.path.split("/") if p]
+        parts = [part for part in parsed.path.split("/") if part]
         if host == "youtu.be" and parts:
             return f"https://www.youtube.com/watch?v={parts[0][:11]}"
         if parts and parts[0] in {"shorts", "embed", "live"} and len(parts) > 1:
@@ -373,7 +509,7 @@ def _ffprobe_streams(path: Path) -> list[dict[str, Any]]:
     except json.JSONDecodeError:
         return []
     streams = payload.get("streams") or []
-    return [s for s in streams if isinstance(s, dict)]
+    return [stream for stream in streams if isinstance(stream, dict)]
 
 
 def _yt_base_opts(target_dir: str) -> dict[str, Any]:
@@ -395,7 +531,7 @@ def _yt_base_opts(target_dir: str) -> dict[str, Any]:
     return opts
 
 
-def download_youtube_sync(url: str, target_dir: str) -> None:
+def download_youtube_sync(url: str, target_dir: str) -> int:
     cleaned_url = clean_youtube_url(url)
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         raise DownloadError("ffmpeg/ffprobe is required for YouTube downloads. Please install ffmpeg.")
@@ -411,6 +547,7 @@ def download_youtube_sync(url: str, target_dir: str) -> None:
     except Exception as exc:
         logger.error("yt-dlp download failed for %s: %s", cleaned_url, exc)
         raise DownloadError(_YT_USER_MESSAGES["generic"], kind="generic") from exc
+    return 0
 
 
 def _flatten_target_directory(target_dir: str) -> list[Path]:
@@ -418,7 +555,7 @@ def _flatten_target_directory(target_dir: str) -> list[Path]:
     media_files: list[Path] = []
 
     for path in list(target_path.rglob("*")):
-        if path.is_file() and path.suffix.lower() in MEDIA_SUFFIXES:
+        if path.is_file() and path.suffix.lower() in MEDIA_SUFFIXES and path.stat().st_size > 0:
             if path.parent != target_path:
                 dest = target_path / path.name
                 if dest.exists():
@@ -428,7 +565,8 @@ def _flatten_target_directory(target_dir: str) -> list[Path]:
             else:
                 media_files.append(path)
 
-    return sorted(list(set(media_files)), key=lambda p: p.name)
+    unique = dedupe_media_files(sorted(set(media_files), key=lambda item: item.name))
+    return sorted(unique, key=lambda item: item.name)
 
 
 def _task_counts(context: ContextTypes.DEFAULT_TYPE) -> dict[int, int]:
@@ -463,7 +601,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "Welcome to the Media Downloader Bot.\n\n"
         "Send an Instagram link (post, reel, story) or YouTube link.\n"
-        "Story links require an instagram_cookies.txt file placed next to the bot.",
+        "Story links and multi-photo posts need instagram_cookies.txt "
+        "or an ig_session_* file next to the bot.",
     )
 
 
@@ -555,19 +694,20 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     sema = _global_download_sema
     assert sema is not None
     story_match = story_target is not None
+    failed_items = 0
 
     try:
         async with sema:
             if is_youtube:
                 yt_url = clean_youtube_url(is_youtube.group(0))
                 await _safe_edit(status_msg, "Downloading YouTube video…")
-                await asyncio.wait_for(
+                failed_items = await asyncio.wait_for(
                     asyncio.to_thread(download_youtube_sync, yt_url, target_dir),
                     timeout=YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS,
                 )
             elif post_match:
                 shortcode = post_match.group(1)
-                await asyncio.wait_for(
+                failed_items = await asyncio.wait_for(
                     asyncio.to_thread(download_post_sync, shortcode, target_dir),
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
                 )
@@ -577,10 +717,8 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await _safe_edit(status_msg, f"Downloading story {media_id} from @{username}…")
                 else:
                     await _safe_edit(status_msg, f"Downloading active stories for @{username}…")
-                
-                # Using yt-dlp with instagram_cookies.txt
-                await asyncio.wait_for(
-                    asyncio.to_thread(download_story_yt_dlp_sync, username, media_id, target_dir),
+                failed_items = await asyncio.wait_for(
+                    asyncio.to_thread(download_story_sync, username, media_id, target_dir),
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
                 )
 
@@ -591,15 +729,16 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not entries:
             raise DownloadError("No media was downloaded. It may be private, deleted, or no longer available.")
 
-        await _safe_edit(status_msg, f"Uploading {len(entries)} file(s) to Telegram…")
+        note = f" {failed_items} item(s) could not be fetched." if failed_items else ""
+        await _safe_edit(status_msg, f"Uploading {len(entries)} file(s) to Telegram…{note}")
 
         with ExitStack() as stack:
             media_group: list[InputMediaDocument] = []
-            for i, path in enumerate(entries):
+            for index, path in enumerate(entries):
                 handle = stack.enter_context(path.open("rb"))
 
                 caption = None
-                if i == len(entries) - 1 and is_instagram:
+                if index == len(entries) - 1 and is_instagram:
                     parts = path.name.split("_")
                     if len(parts) >= 4 and parts[0].count("-") == 2:
                         date_str = parts[0].replace("-", "")
@@ -622,10 +761,10 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     )
                 )
 
-            for i in range(0, len(media_group), TELEGRAM_MEDIA_GROUP_LIMIT):
+            for index in range(0, len(media_group), TELEGRAM_MEDIA_GROUP_LIMIT):
                 await context.bot.send_media_group(
                     chat_id=chat_id,
-                    media=media_group[i : i + TELEGRAM_MEDIA_GROUP_LIMIT],
+                    media=media_group[index : index + TELEGRAM_MEDIA_GROUP_LIMIT],
                 )
 
         await status_msg.delete()
@@ -651,8 +790,11 @@ async def _post_init(application: Application) -> None:
     _slot_lock = asyncio.Lock()
     load_user_id_cache()
 
-    if not Path(IG_COOKIES_FILE).is_file():
-        logger.warning("Notice: %s not found. Story downloads will fail until added.", IG_COOKIES_FILE)
+    if not Path(IG_COOKIES_FILE).is_file() and not get_available_session_files():
+        logger.warning(
+            "Notice: %s and ig_session_* were not found. Instagram downloads will fail until one is added.",
+            IG_COOKIES_FILE,
+        )
 
     logger.info("Bot is ready.")
 
