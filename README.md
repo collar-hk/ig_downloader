@@ -14,7 +14,7 @@ export TELEGRAM_BOT_TOKEN=your-token
 python bot.py
 ```
 
-The process has to stay running. A host that only installs dependencies and does not run `python bot.py` will leave Telegram with no reply. `Procfile` and `nixpacks.toml` both start that command.
+The process has to stay running. On Railway the image is built from the `Dockerfile`, which installs Python, `pip`, and `requirements.txt` (including `python-telegram-bot` and `instaloader`) and starts `python bot.py`. Redeploy after pulling this change. Inside the container, `python3 -c "import instaloader, telegram"` should succeed.
 
 Sending a post, reel, `/reels/`, story, profile, or Instagram share link gets an immediate "Fetching…" reply. Share links are followed to the real post or story. A link the bot cannot read is answered instead of ignored.
 

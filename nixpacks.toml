@@ -1,8 +1,7 @@
-[providers]
-providers = ['python', 'node']
+providers = ["python"]
 
-[pkgs]
-pkgs = ['ffmpeg', 'nodejs']
+[phases.setup]
+nixPkgs = ["...", "ffmpeg", "nodejs"]
 
 [start]
-cmd = 'python bot.py'
+cmd = "python bot.py"

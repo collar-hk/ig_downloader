@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "provider": "python",
+  "packages": {
+    "python": "3.12",
+    "node": "22"
+  },
+  "deploy": {
+    "startCommand": "python bot.py",
+    "aptPackages": ["...", "ffmpeg"],
+    "paths": ["...", "/app/.venv/bin"]
+  }
+}
