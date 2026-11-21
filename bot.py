@@ -33,11 +33,13 @@ from telegram.ext import (
 
 from ig_media import (
     LoginRequired,
+    MediaUnavailable,
     build_instagram_session,
     classify_instagram,
     dedupe_media_files,
     expand_instagram_text,
     fetch_html,
+    fetch_post_assets,
     parse_html_payloads,
     post_assets_from_payloads,
     save_assets,
@@ -279,36 +281,65 @@ def download_post_sync(shortcode: str, target_dir: str) -> int:
     saved = 0
     expected = 0
     page_error: Exception | None = None
+    referer = f"https://www.instagram.com/p/{shortcode}/"
 
-    for page_url in (
-        f"https://www.instagram.com/p/{shortcode}/",
-        f"https://www.instagram.com/reel/{shortcode}/",
-    ):
-        try:
-            page_html, _final_url = fetch_html(session, page_url)
-            assets, expected = post_assets_from_payloads(parse_html_payloads(page_html), shortcode)
-        except LoginRequired as exc:
-            page_error = exc
-            continue
-        except Exception as exc:
-            page_error = exc
-            logger.warning("Post page parse failed for %s: %s", shortcode, exc)
-            continue
-        if not assets:
-            continue
-        saved, failures = save_assets(session, assets, target_dir, referer=page_url)
-        logger.info("Post %s: page listed %s slide(s), saved %s", shortcode, expected, saved)
-        if saved and (expected <= saved):
-            return len(failures)
-        break
+    # Prefer the media-info / Polaris APIs. HTML pages and Instaloader's
+    # logged-in graphql/query path often redirect to the homepage now.
+    try:
+        assets, expected = fetch_post_assets(session, shortcode)
+        if assets:
+            saved, failures = save_assets(session, assets, target_dir, referer=referer)
+            logger.info("Post %s: API listed %s slide(s), saved %s", shortcode, expected, saved)
+            if saved and (expected <= saved):
+                return len(failures)
+    except LoginRequired as exc:
+        page_error = exc
+        logger.warning("Post %s API requires a fresh login: %s", shortcode, exc)
+    except MediaUnavailable as exc:
+        raise DownloadError(_IG_USER_MESSAGES["not_found"], kind="not_found") from exc
+    except Exception as exc:
+        page_error = exc
+        logger.warning("Post %s API lookup failed: %s", shortcode, exc)
 
-    # The page listed more slides than it actually embedded, or it embedded none.
-    # Instaloader's post API still returns sidecar children for a logged-in session.
+    if saved == 0 or (expected and saved < expected):
+        for page_url in (
+            f"https://www.instagram.com/p/{shortcode}/",
+            f"https://www.instagram.com/reel/{shortcode}/",
+        ):
+            try:
+                page_html, _final_url = fetch_html(session, page_url)
+                page_assets, page_expected = post_assets_from_payloads(
+                    parse_html_payloads(page_html), shortcode
+                )
+            except LoginRequired as exc:
+                page_error = page_error or exc
+                continue
+            except Exception as exc:
+                page_error = page_error or exc
+                logger.warning("Post page parse failed for %s: %s", shortcode, exc)
+                continue
+            if not page_assets:
+                continue
+            expected = max(expected, page_expected)
+            saved, failures = save_assets(session, page_assets, target_dir, referer=page_url)
+            logger.info("Post %s: page listed %s slide(s), saved %s", shortcode, expected, saved)
+            if saved and (expected <= saved):
+                return len(failures)
+            break
+
     if saved == 0 or (expected and saved < expected):
         try:
             before = _count_media(target_dir)
             loader, current_user = get_thread_safe_loader()
-            post = instaloader.Post.from_shortcode(loader.context, shortcode)
+            # Logged-in Instaloader posts to graphql/query, which Instagram redirects.
+            # Clear username only while resolving metadata so Instaloader uses api/graphql.
+            previous_username = loader.context.username
+            try:
+                if previous_username:
+                    loader.context.username = None
+                post = instaloader.Post.from_shortcode(loader.context, shortcode)
+            finally:
+                loader.context.username = previous_username
             loader.download_post(post, target=Path(target_dir))
             after = _count_media(target_dir)
             logger.info(
@@ -322,14 +353,51 @@ def download_post_sync(shortcode: str, target_dir: str) -> int:
             logger.warning("Post %s instaloader fallback failed: %s", shortcode, exc)
             page_error = page_error or exc
 
+    if saved == 0 and _count_media(target_dir) <= 0:
+        try:
+            _download_post_ytdlp(shortcode, target_dir)
+        except Exception as exc:
+            logger.warning("Post %s yt-dlp fallback failed: %s", shortcode, exc)
+            page_error = page_error or exc
+
     if saved <= 0 and _count_media(target_dir) <= 0:
         if isinstance(page_error, LoginRequired) or (
-            page_error is not None and "login" in _exc_blob(page_error).lower()
+            page_error is not None and any(
+                token in _exc_blob(page_error).lower() for token in ("login", "cookie", "401", "403")
+            )
         ):
             raise DownloadError(_IG_USER_MESSAGES["login"], kind="login") from page_error
-        log_failed_account(f"post_{shortcode}", str(page_error or "no media"))
+        detail = str(page_error).strip() if page_error else ""
+        log_failed_account(f"post_{shortcode}", detail or "no media")
+        if detail:
+            raise DownloadError(
+                f"Could not download that Instagram media. {detail[:240]}",
+                kind="generic",
+            ) from page_error
         raise DownloadError(_IG_USER_MESSAGES["generic"], kind="generic")
     return len(failures)
+
+
+def _download_post_ytdlp(shortcode: str, target_dir: str) -> None:
+    """Fallback that uses yt-dlp's logged-in media-info path when cookies are present."""
+    cookies_path = Path(IG_COOKIES_FILE)
+    if not cookies_path.is_file():
+        raise DownloadError(_IG_USER_MESSAGES["login"], kind="login")
+
+    url = f"https://www.instagram.com/p/{shortcode}/"
+    outtmpl = os.path.join(target_dir, "%(upload_date)s_%(uploader)s_GraphVideo_%(id)s.%(ext)s")
+    opts: dict[str, Any] = {
+        "outtmpl": outtmpl,
+        "cookiefile": str(cookies_path),
+        "quiet": True,
+        "no_warnings": True,
+        "restrictfilenames": True,
+        "ignoreerrors": True,
+        "retries": 3,
+    }
+    logger.info("Downloading Instagram post via yt-dlp (%s)", shortcode)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
 
 
 def _download_stories_with_instaloader(username: str, media_id: str | None, target_dir: str) -> int:

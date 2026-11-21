@@ -6,13 +6,17 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from unittest.mock import MagicMock
+
 from ig_media import (
     MediaAsset,
     classify_instagram,
     dedupe_media_files,
+    fetch_post_assets,
     parse_html_payloads,
     post_assets_from_payloads,
     save_assets,
+    shortcode_to_media_id,
     story_assets_from_payloads,
 )
 from story_cache import StoryUnavailable, parse_story_target
@@ -87,6 +91,24 @@ POST_PAGE = {
     }
 }
 
+WEB_INFO_PAGE = {
+    "data": {
+        "xdt_api__v1__media__shortcode__web_info": {
+            "items": [
+                {
+                    "code": "WEBINFO1",
+                    "user": {"username": "ada"},
+                    "carousel_media_count": 2,
+                    "carousel_media": [
+                        _photo(21, "https://cdn.example/web1.jpg"),
+                        _video(22, "https://cdn.example/web2.mp4"),
+                    ],
+                }
+            ]
+        }
+    }
+}
+
 
 class ExtractTests(unittest.TestCase):
     def test_story_keeps_photos_and_videos_and_skips_other_reels(self) -> None:
@@ -107,6 +129,47 @@ class ExtractTests(unittest.TestCase):
         self.assertEqual(expected, 3)
         self.assertEqual([asset.suffix for asset in assets], [".jpg", ".mp4", ".jpg"])
         self.assertEqual([asset.media_id for asset in assets], ["1", "2", "3"])
+
+    def test_web_info_payload_includes_carousel_slides(self) -> None:
+        assets, expected = post_assets_from_payloads([WEB_INFO_PAGE], "WEBINFO1")
+        self.assertEqual(expected, 2)
+        self.assertEqual([asset.suffix for asset in assets], [".jpg", ".mp4"])
+        self.assertEqual([asset.media_id for asset in assets], ["21", "22"])
+
+    def test_shortcode_to_media_id(self) -> None:
+        self.assertEqual(shortcode_to_media_id("Chunk8-jurw"), 2913440072144448240)
+
+    def test_fetch_post_assets_uses_media_info(self) -> None:
+        item = {
+            "code": "ABC123xyz",
+            "user": {"username": "ada"},
+            "carousel_media_count": 2,
+            "carousel_media": [
+                _photo(1, "https://cdn.example/slide1.jpg"),
+                _video(2, "https://cdn.example/slide2.mp4"),
+            ],
+        }
+
+        class Response:
+            status_code = 200
+            url = "https://www.instagram.com/api/v1/media/1/info/"
+            headers = {"Content-Type": "application/json"}
+
+            def json(self):
+                return {"items": [item]}
+
+            @property
+            def text(self):
+                return ""
+
+        session = MagicMock()
+        session.cookies.get.return_value = "csrf-token"
+        session.get.return_value = Response()
+
+        assets, expected = fetch_post_assets(session, "ABC123xyz")
+        self.assertEqual(expected, 2)
+        self.assertEqual([asset.suffix for asset in assets], [".jpg", ".mp4"])
+        self.assertTrue(session.get.called)
 
     def test_post_reports_declared_count_when_children_are_truncated(self) -> None:
         truncated = {

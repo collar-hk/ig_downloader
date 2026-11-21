@@ -18,10 +18,14 @@ The process has to stay running. On Railway the image is built from the `Dockerf
 
 Sending a post, reel, `/reels/`, story, profile, or Instagram share link gets an immediate "Fetching…" reply. Share links are followed to the real post or story. A link the bot cannot read is answered instead of ignored.
 
+Posts are fetched through Instagram's media-info API first. The old logged-in GraphQL page check redirects to the homepage and used to produce a generic failure.
+
 Instagram needs a logged-in browser session. Put either of these next to `bot.py`:
 
 - `instagram_cookies.txt`, a Netscape cookie export that includes `sessionid`
 - `ig_session_<username>`, an Instaloader session file
+
+`python convert.py` writes `ig_session_<username>` from `instagram_cookies.txt`. It does not call Instagram's `graphql/query` login check, which now redirects to the homepage and retries forever.
 
 YouTube needs `ffmpeg` and `ffprobe`. A Netscape `cookies.txt` is optional and is used when YouTube asks for a logged-in browser.
 

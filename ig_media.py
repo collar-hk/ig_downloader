@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 import requests
 
@@ -58,6 +59,7 @@ _SCRIPT_JSON_RE = re.compile(
 )
 _MARKERS = (
     "xdt_api__v1__feed__reels_media",
+    "xdt_api__v1__media__shortcode__web_info",
     "xig_polaris_media",
     "shortcode_media",
 )
@@ -67,10 +69,17 @@ _MEDIA_MAGIC = (
     b"GIF8",
     b"RIFF",  # webp
 )
+_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+POST_WEB_INFO_DOC_ID = "27128499623469141"
+_IG_APP_ID = "936619743392459"
 
 
 class LoginRequired(Exception):
     """The Instagram response is a login wall rather than the media page."""
+
+
+class MediaUnavailable(Exception):
+    """Instagram answered, but the media is gone or inaccessible."""
 
 
 @dataclass(frozen=True)
@@ -190,10 +199,196 @@ def session_has_login(session: requests.Session) -> bool:
     return False
 
 
+def shortcode_to_media_id(shortcode: str) -> int:
+    """Convert an Instagram shortcode to the numeric media id Instagram APIs use."""
+    code = (shortcode or "").strip()
+    if len(code) > 28:
+        code = code[:-28]
+    if not code:
+        raise ValueError("empty shortcode")
+    value = 0
+    for char in code:
+        index = _SHORTCODE_ALPHABET.find(char)
+        if index < 0:
+            raise ValueError(f"invalid shortcode character: {char!r}")
+        value = value * 64 + index
+    return value
+
+
+def ensure_csrf(session: requests.Session) -> str | None:
+    """Return a csrftoken, fetching Instagram once when the jar does not have one."""
+    token = session.cookies.get("csrftoken")
+    if token:
+        return token
+    try:
+        session.get("https://www.instagram.com/", timeout=20)
+    except requests.RequestException:
+        return session.cookies.get("csrftoken")
+    return session.cookies.get("csrftoken")
+
+
+def fetch_post_assets(
+    session: requests.Session,
+    shortcode: str,
+) -> tuple[list[MediaAsset], int]:
+    """Load every slide of a post through Instagram APIs that still return media JSON.
+
+    Logged-in Instaloader still posts to ``graphql/query``, which Instagram now
+    redirects to the homepage. The media-info API and the Polaris web_info query
+    are the paths that still return carousel photos and videos.
+    """
+    errors: list[str] = []
+    for loader in (_fetch_post_via_media_info, _fetch_post_via_graphql):
+        try:
+            assets, expected = loader(session, shortcode)
+        except LoginRequired:
+            raise
+        except MediaUnavailable:
+            raise
+        except Exception as exc:
+            errors.append(f"{loader.__name__}: {exc}")
+            continue
+        if assets:
+            return assets, expected
+        if expected:
+            errors.append(f"{loader.__name__}: expected {expected} slide(s) but found none")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return [], 0
+
+
+def _fetch_post_via_media_info(
+    session: requests.Session,
+    shortcode: str,
+) -> tuple[list[MediaAsset], int]:
+    media_id = shortcode_to_media_id(shortcode)
+    csrf = ensure_csrf(session)
+    headers = {
+        "X-IG-App-ID": _IG_APP_ID,
+        "X-ASBD-ID": "359341",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "*/*",
+        "Referer": f"https://www.instagram.com/p/{shortcode}/",
+    }
+    if csrf:
+        headers["X-CSRFToken"] = csrf
+
+    last_error: Exception | None = None
+    for url in (
+        f"https://www.instagram.com/api/v1/media/{media_id}/info/",
+        f"https://i.instagram.com/api/v1/media/{media_id}/info/",
+    ):
+        try:
+            response = session.get(url, headers=headers, timeout=60, allow_redirects=True)
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+        final_url = response.url or url
+        if response.status_code in {401, 403} or _is_login_url(final_url):
+            raise LoginRequired(f"Instagram sent media info to {final_url}")
+        if response.status_code == 404:
+            raise MediaUnavailable(f"Instagram has no media for {shortcode}")
+        if response.status_code >= 400:
+            last_error = RuntimeError(f"HTTP {response.status_code} from {url}")
+            continue
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            if _page_requires_login(response.text, final_url):
+                raise LoginRequired("Instagram returned a login page for media info") from exc
+            last_error = RuntimeError(f"media info was not JSON ({exc})")
+            continue
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not items:
+            last_error = RuntimeError("media info response had no items")
+            continue
+        return post_assets_from_payloads(items, shortcode)
+    if last_error is not None:
+        raise last_error
+    return [], 0
+
+
+def _fetch_post_via_graphql(
+    session: requests.Session,
+    shortcode: str,
+) -> tuple[list[MediaAsset], int]:
+    csrf = ensure_csrf(session)
+    if not csrf:
+        raise RuntimeError("no csrftoken available for the GraphQL post lookup")
+
+    headers = {
+        "X-IG-App-ID": _IG_APP_ID,
+        "X-ASBD-ID": "359341",
+        "X-CSRFToken": csrf,
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+        "Origin": "https://www.instagram.com",
+        "Referer": f"https://www.instagram.com/p/{shortcode}/",
+    }
+    body = {
+        "variables": json.dumps(
+            {
+                "shortcode": shortcode,
+                "__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider": False,
+            },
+            separators=(",", ":"),
+        ),
+        "doc_id": POST_WEB_INFO_DOC_ID,
+        "server_timestamps": "true",
+    }
+
+    last_error: Exception | None = None
+    for path in ("api/graphql", "graphql/query"):
+        url = f"https://www.instagram.com/{path}"
+        try:
+            response = session.post(url, data=body, headers=headers, timeout=60, allow_redirects=True)
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+        final_url = response.url or url
+        if response.status_code in {401, 403} or _is_login_url(final_url):
+            raise LoginRequired(f"Instagram sent GraphQL to {final_url}")
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if "json" not in content_type:
+            if _page_requires_login(response.text, final_url):
+                raise LoginRequired("Instagram returned HTML instead of GraphQL JSON")
+            last_error = RuntimeError(f"{path} returned {content_type or 'non-JSON'}")
+            continue
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            last_error = RuntimeError(f"{path} JSON decode failed: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            last_error = RuntimeError(f"{path} returned a non-object JSON body")
+            continue
+        if payload.get("status") == "fail" or payload.get("require_login"):
+            message = str(payload.get("message") or "GraphQL rejected the request")
+            if "login" in message.lower() or payload.get("require_login"):
+                raise LoginRequired(message)
+            last_error = RuntimeError(message)
+            continue
+        web_info = (payload.get("data") or {}).get("xdt_api__v1__media__shortcode__web_info") or {}
+        items = web_info.get("items") if isinstance(web_info, dict) else None
+        if not isinstance(items, list) or not items:
+            last_error = RuntimeError(f"{path} returned no web_info items")
+            continue
+        return post_assets_from_payloads(items, shortcode)
+    if last_error is not None:
+        raise last_error
+    return [], 0
+
+
+def _is_login_url(url: str) -> bool:
+    path = urlparse(url or "").path or "/"
+    return path.startswith("/accounts/login") or path == "/"
+
+
 def fetch_html(session: requests.Session, url: str) -> tuple[str, str]:
     response = session.get(url, timeout=60, allow_redirects=True)
     final_url = response.url or url
-    if response.status_code in {401, 403} or "accounts/login" in final_url:
+    if response.status_code in {401, 403} or _is_login_url(final_url):
         raise LoginRequired(f"Instagram sent the request to {final_url}")
     response.raise_for_status()
     text = response.text
@@ -526,9 +721,17 @@ def _walk(value: Any):
 
 
 def _page_requires_login(page_html: str, final_url: str) -> bool:
-    if "accounts/login" in final_url:
+    if _is_login_url(final_url):
         return True
-    if any(marker in page_html for marker in ("image_versions2", "reels_media", "shortcode_media", "video_versions")):
+    markers = (
+        "image_versions2",
+        "reels_media",
+        "shortcode_media",
+        "video_versions",
+        "xdt_api__v1__media__shortcode__web_info",
+        "xig_polaris_media",
+    )
+    if any(marker in page_html for marker in markers):
         return False
     head = page_html[:8000].lower()
     return "password" in head and "login" in head
