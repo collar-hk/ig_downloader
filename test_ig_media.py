@@ -113,31 +113,55 @@ WEB_INFO_PAGE = {
 class ExtractTests(unittest.TestCase):
     def test_story_keeps_photos_and_videos_and_skips_other_reels(self) -> None:
         assets = story_assets_from_payloads([STORY_PAGE], "Ada", None)
-        self.assertEqual([asset.media_id for asset in assets], ["11", "12", "13"])
-        self.assertEqual([asset.suffix for asset in assets], [".jpg", ".mp4", ".jpg"])
+        self.assertEqual(
+            [(asset.media_id, asset.suffix) for asset in assets],
+            [("11", ".jpg"), ("12", ".mp4"), ("12", ".jpg"), ("13", ".jpg")],
+        )
         self.assertEqual(assets[0].url, "https://cdn.example/photo.jpg")
         self.assertEqual(assets[1].url, "https://cdn.example/video.mp4")
-        self.assertEqual(assets[0].kind, "GraphStoryImage")
         self.assertEqual(assets[1].kind, "GraphStoryVideo")
+        self.assertEqual(assets[2].kind, "GraphStoryVideo")
+        self.assertEqual(assets[2].url, "https://cdn.example/cover.jpg")
+        self.assertEqual(assets[0].kind, "GraphStoryImage")
 
     def test_story_media_id_filters_to_one_item(self) -> None:
         assets = story_assets_from_payloads([STORY_PAGE], "ada", "12")
-        self.assertEqual([asset.media_id for asset in assets], ["12"])
+        self.assertEqual([asset.media_id for asset in assets], ["12", "12"])
+        self.assertEqual([asset.suffix for asset in assets], [".mp4", ".jpg"])
 
     def test_post_carousel_includes_every_slide(self) -> None:
         assets, expected = post_assets_from_payloads([POST_PAGE], "ABC123xyz")
         self.assertEqual(expected, 3)
-        self.assertEqual([asset.suffix for asset in assets], [".jpg", ".mp4", ".jpg"])
-        self.assertEqual([asset.media_id for asset in assets], ["1", "2", "3"])
+        self.assertEqual(
+            [(asset.media_id, asset.suffix) for asset in assets],
+            [("1", ".jpg"), ("2", ".mp4"), ("2", ".jpg"), ("3", ".jpg")],
+        )
 
     def test_web_info_payload_includes_carousel_slides(self) -> None:
         assets, expected = post_assets_from_payloads([WEB_INFO_PAGE], "WEBINFO1")
         self.assertEqual(expected, 2)
-        self.assertEqual([asset.suffix for asset in assets], [".jpg", ".mp4"])
-        self.assertEqual([asset.media_id for asset in assets], ["21", "22"])
+        self.assertEqual(
+            [(asset.media_id, asset.suffix) for asset in assets],
+            [("21", ".jpg"), ("22", ".mp4"), ("22", ".jpg")],
+        )
 
     def test_shortcode_to_media_id(self) -> None:
         self.assertEqual(shortcode_to_media_id("Chunk8-jurw"), 2913440072144448240)
+
+    def test_username_from_caption_user_and_pk_media_id(self) -> None:
+        node = {
+            "id": "555_999",
+            "pk": 555,
+            "caption": {"user": {"username": "FromCaption"}},
+            "media_type": 2,
+            "video_versions": [{"url": "https://cdn.example/v.mp4", "width": 720, "height": 1280}],
+            "image_versions2": {"candidates": [{"url": "https://cdn.example/t.jpg", "width": 720, "height": 1280}]},
+        }
+        assets, expected = post_assets_from_payloads([{"code": "CODE1", **node}], "CODE1")
+        self.assertEqual(expected, 1)
+        self.assertEqual([asset.username for asset in assets], ["fromcaption", "fromcaption"])
+        self.assertEqual([asset.media_id for asset in assets], ["555", "555"])
+        self.assertEqual([asset.suffix for asset in assets], [".mp4", ".jpg"])
 
     def test_fetch_post_assets_uses_media_info(self) -> None:
         item = {
@@ -168,7 +192,7 @@ class ExtractTests(unittest.TestCase):
 
         assets, expected = fetch_post_assets(session, "ABC123xyz")
         self.assertEqual(expected, 2)
-        self.assertEqual([asset.suffix for asset in assets], [".jpg", ".mp4"])
+        self.assertEqual([asset.suffix for asset in assets], [".jpg", ".mp4", ".jpg"])
         self.assertTrue(session.get.called)
 
     def test_post_reports_declared_count_when_children_are_truncated(self) -> None:

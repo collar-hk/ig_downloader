@@ -463,16 +463,20 @@ def story_assets_from_payloads(
     assets: list[MediaAsset] = []
     for item in chosen:
         for piece in _explode(item):
-            asset = _asset_from_node(piece, default_username=want, story=True)
-            if asset is None:
+            piece_assets = _assets_from_node(piece, default_username=want, story=True)
+            if not piece_assets:
                 continue
-            if media_id and asset.media_id != str(media_id) and not asset.media_id.endswith(f"-{media_id}"):
-                # Carousel pieces keep the parent id as a prefix; a direct hit
-                # on the story id still has to match the parent.
-                parent_id = str(item.get("pk") or item.get("id") or "")
-                if parent_id != str(media_id):
+            if media_id:
+                asset_id = piece_assets[0].media_id
+                parent_id = str(item.get("pk") or item.get("id") or "").split("_", 1)[0]
+                want_id = str(media_id)
+                if (
+                    asset_id != want_id
+                    and not asset_id.endswith(f"-{want_id}")
+                    and parent_id != want_id
+                ):
                     continue
-            assets.append(asset)
+            assets.extend(piece_assets)
     return _dedupe_assets(assets)
 
 
@@ -490,14 +494,18 @@ def post_assets_from_payloads(
         return [], 0
 
     best = max(matched, key=lambda node: (len(_explode(node)), _declared_count(node)))
+    default_username = _username_of(best)
     pieces = _explode(best)
-    assets = [
-        asset
-        for piece in pieces
-        if (asset := _asset_from_node(piece, default_username=_username_of(best), story=False)) is not None
-    ]
-    expected = max(_declared_count(best), len(assets))
-    return _dedupe_assets(assets), expected
+    assets: list[MediaAsset] = []
+    for piece in pieces:
+        assets.extend(_assets_from_node(piece, default_username=default_username, story=False))
+    unique = _dedupe_assets(assets)
+    # Thumbnails share a media id with the video; expected slide count ignores covers.
+    primary = [asset for asset in unique if asset.suffix != ".jpg" or asset.kind.endswith("Image")]
+    if not primary:
+        primary = unique
+    expected = max(_declared_count(best), len({asset.media_id for asset in primary}))
+    return unique, expected
 
 
 def save_assets(
@@ -569,13 +577,24 @@ def _filename(asset: MediaAsset) -> str:
 
 
 def _asset_from_node(node: dict[str, Any], *, default_username: str | None, story: bool) -> MediaAsset | None:
+    assets = _assets_from_node(node, default_username=default_username, story=story)
+    return assets[0] if assets else None
+
+
+def _assets_from_node(
+    node: dict[str, Any],
+    *,
+    default_username: str | None,
+    story: bool,
+) -> list[MediaAsset]:
+    """Primary media, plus a jpg cover when the primary file is a video."""
     chosen = _choose_url(node)
     if chosen is None:
-        return None
+        return []
     url, suffix, visual_kind = chosen
     media_id = _media_id(node)
     if not media_id:
-        return None
+        return []
     if story:
         kind = "GraphStoryVideo" if visual_kind == "video" else "GraphStoryImage"
     else:
@@ -583,14 +602,30 @@ def _asset_from_node(node: dict[str, Any], *, default_username: str | None, stor
     taken_at = node.get("taken_at") or node.get("taken_at_timestamp")
     taken = int(taken_at) if isinstance(taken_at, (int, float)) else None
     username = _username_of(node) or default_username
-    return MediaAsset(
-        media_id=media_id,
-        url=url,
-        suffix=suffix,
-        taken_at=taken,
-        username=username,
-        kind=kind,
-    )
+    assets = [
+        MediaAsset(
+            media_id=media_id,
+            url=url,
+            suffix=suffix,
+            taken_at=taken,
+            username=username,
+            kind=kind,
+        )
+    ]
+    if visual_kind == "video":
+        thumb = _choose_image_url(node)
+        if thumb is not None and thumb != url:
+            assets.append(
+                MediaAsset(
+                    media_id=media_id,
+                    url=thumb,
+                    suffix=".jpg",
+                    taken_at=taken,
+                    username=username,
+                    kind=kind,
+                )
+            )
+    return assets
 
 
 def _choose_url(node: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -604,11 +639,18 @@ def _choose_url(node: dict[str, Any]) -> tuple[str, str, str] | None:
     if isinstance(resources, list) and resources and isinstance(resources[-1], dict) and resources[-1].get("src"):
         return str(resources[-1]["src"]), ".mp4", "video"
 
+    image = _choose_image_url(node)
+    if image is not None:
+        return image, ".jpg", "image"
+    return None
+
+
+def _choose_image_url(node: dict[str, Any]) -> str | None:
     candidates = ((node.get("image_versions2") or {}).get("candidates") or [])
     pictures = [item for item in candidates if isinstance(item, dict) and item.get("url")]
     if pictures:
         best = max(pictures, key=lambda item: (item.get("width") or 0) * (item.get("height") or 0))
-        return str(best["url"]), ".jpg", "image"
+        return str(best["url"])
     display_resources = node.get("display_resources") or []
     if (
         isinstance(display_resources, list)
@@ -616,9 +658,9 @@ def _choose_url(node: dict[str, Any]) -> tuple[str, str, str] | None:
         and isinstance(display_resources[-1], dict)
         and display_resources[-1].get("src")
     ):
-        return str(display_resources[-1]["src"]), ".jpg", "image"
+        return str(display_resources[-1]["src"])
     if isinstance(node.get("display_url"), str) and node["display_url"]:
-        return node["display_url"], ".jpg", "image"
+        return node["display_url"]
     return None
 
 
@@ -685,6 +727,13 @@ def _username_of(node: dict[str, Any]) -> str | None:
             username = value.get("username")
             if isinstance(username, str) and username.strip():
                 return username.strip().lstrip("@").lower()
+    caption = node.get("caption")
+    if isinstance(caption, dict):
+        caption_user = caption.get("user")
+        if isinstance(caption_user, dict):
+            username = caption_user.get("username")
+            if isinstance(username, str) and username.strip():
+                return username.strip().lstrip("@").lower()
     username = node.get("username")
     if isinstance(username, str) and username.strip():
         return username.strip().lstrip("@").lower()
@@ -692,10 +741,14 @@ def _username_of(node: dict[str, Any]) -> str | None:
 
 
 def _media_id(node: dict[str, Any]) -> str:
-    for key in ("pk", "id", "code", "shortcode"):
+    for key in ("pk", "code", "shortcode"):
         value = node.get(key)
         if value is not None and str(value).strip():
-            return str(value).strip()
+            return str(value).strip().split("_", 1)[0]
+    value = node.get("id")
+    if value is not None and str(value).strip():
+        # Instagram often stores id as "<pk>_<user_id>".
+        return str(value).strip().split("_", 1)[0]
     return ""
 
 
@@ -703,9 +756,10 @@ def _dedupe_assets(assets: list[MediaAsset]) -> list[MediaAsset]:
     seen: set[str] = set()
     unique: list[MediaAsset] = []
     for asset in assets:
-        if asset.media_id in seen:
+        key = f"{asset.media_id}:{asset.suffix}:{asset.kind}"
+        if key in seen:
             continue
-        seen.add(asset.media_id)
+        seen.add(key)
         unique.append(asset)
     return unique
 

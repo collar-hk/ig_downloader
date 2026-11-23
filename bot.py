@@ -247,6 +247,13 @@ def get_thread_safe_loader() -> tuple[instaloader.Instaloader, str | None]:
     return loader, ig_user
 
 
+_IG_FILENAME_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})_(?P<user>.+)_"
+    r"(?P<kind>Graph(?:Story)?(?:Image|Video|Sidecar))_(?P<id>.+?)\.[^.]+$",
+    re.I,
+)
+
+
 def _friendly_filename(name: str) -> str:
     replacements = (
         ("GraphImage", "Photo"),
@@ -258,6 +265,27 @@ def _friendly_filename(name: str) -> str:
     for old, new in replacements:
         name = name.replace(old, new)
     return name
+
+
+def _instagram_caption(path: Path, *, story: bool, reel: bool) -> str | None:
+    """Build `#YYYYMMDD #usernameIG…` from the saved filename."""
+    match = _IG_FILENAME_RE.match(path.name)
+    if not match:
+        return None
+    date_str = match.group("date").replace("-", "")
+    ig_user = match.group("user")
+    if story:
+        ig_type = "IGS"
+    elif reel:
+        ig_type = "IGReels"
+    else:
+        ig_type = "IG"
+    return f"#{date_str} #{ig_user}{ig_type}"
+
+
+def _is_reel_link(text: str) -> bool:
+    lower = (text or "").lower()
+    return "/reel/" in lower or "/reels/" in lower
 
 
 def _instagram_session():
@@ -385,7 +413,10 @@ def _download_post_ytdlp(shortcode: str, target_dir: str) -> None:
         raise DownloadError(_IG_USER_MESSAGES["login"], kind="login")
 
     url = f"https://www.instagram.com/p/{shortcode}/"
-    outtmpl = os.path.join(target_dir, "%(upload_date)s_%(uploader)s_GraphVideo_%(id)s.%(ext)s")
+    outtmpl = os.path.join(
+        target_dir,
+        "%(upload_date>%Y-%m-%d|1970-01-01)s_%(uploader|instagram)s_GraphVideo_%(id)s.%(ext)s",
+    )
     opts: dict[str, Any] = {
         "outtmpl": outtmpl,
         "cookiefile": str(cookies_path),
@@ -394,6 +425,7 @@ def _download_post_ytdlp(shortcode: str, target_dir: str) -> None:
         "restrictfilenames": True,
         "ignoreerrors": True,
         "retries": 3,
+        "writethumbnail": True,
     }
     logger.info("Downloading Instagram post via yt-dlp (%s)", shortcode)
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -850,19 +882,11 @@ async def media_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
                 caption = None
                 if index == len(entries) - 1 and is_instagram:
-                    parts = path.name.split("_")
-                    if len(parts) >= 4 and parts[0].count("-") == 2:
-                        date_str = parts[0].replace("-", "")
-                        ig_user = "_".join(parts[1:-2])
-
-                        if story_match:
-                            ig_type = "IGS"
-                        elif kind == "post" and "/reel/" in text.lower():
-                            ig_type = "IGReels"
-                        else:
-                            ig_type = "IG"
-
-                        caption = f"#{date_str} #{ig_user}{ig_type}"
+                    caption = _instagram_caption(
+                        path,
+                        story=story_match,
+                        reel=(kind == "post" and _is_reel_link(text)),
+                    )
 
                 media_group.append(
                     InputMediaDocument(
