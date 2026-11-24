@@ -15,8 +15,10 @@ from ig_media import (
     fetch_post_assets,
     parse_html_payloads,
     post_assets_from_payloads,
+    post_download_complete,
     save_assets,
     shortcode_to_media_id,
+    slide_count,
     story_assets_from_payloads,
 )
 from story_cache import StoryUnavailable, parse_story_target
@@ -204,6 +206,58 @@ class ExtractTests(unittest.TestCase):
         assets, expected = post_assets_from_payloads([truncated], "SHORT1")
         self.assertEqual(len(assets), 1)
         self.assertEqual(expected, 4)
+        self.assertEqual(slide_count(assets), 1)
+        self.assertFalse(post_download_complete(assets, expected, []))
+
+    def test_video_thumbnail_does_not_count_as_second_slide(self) -> None:
+        truncated = {
+            "code": "MIXED1",
+            "media_type": 8,
+            "carousel_media_count": 2,
+            "carousel_media": [_video(10, "https://cdn.example/only-video.mp4")],
+        }
+        assets, expected = post_assets_from_payloads([truncated], "MIXED1")
+        self.assertEqual(expected, 2)
+        self.assertEqual(slide_count(assets), 1)
+        self.assertEqual([asset.suffix for asset in assets], [".mp4", ".jpg"])
+        self.assertFalse(post_download_complete(assets, expected, []))
+
+    def test_photo_and_video_carousel_is_complete(self) -> None:
+        payload = {
+            "code": "MIXED2",
+            "media_type": 8,
+            "carousel_media_count": 2,
+            "carousel_media": [
+                _video(10, "https://cdn.example/clip.mp4"),
+                _photo(11, "https://cdn.example/still.jpg"),
+            ],
+        }
+        assets, expected = post_assets_from_payloads([payload], "MIXED2")
+        self.assertEqual(expected, 2)
+        self.assertEqual(slide_count(assets), 2)
+        self.assertTrue(post_download_complete(assets, expected, []))
+
+    def test_merges_photo_slide_from_fuller_payload_copy(self) -> None:
+        video_only = {
+            "code": "MIXED3",
+            "media_type": 2,
+            "video_versions": [{"url": "https://cdn.example/v.mp4", "width": 720, "height": 1280}],
+            "image_versions2": {"candidates": [{"url": "https://cdn.example/c.jpg", "width": 720, "height": 1280}]},
+            "pk": 10,
+        }
+        full = {
+            "code": "MIXED3",
+            "media_type": 8,
+            "carousel_media_count": 2,
+            "carousel_media": [
+                _video(10, "https://cdn.example/v.mp4"),
+                _photo(11, "https://cdn.example/p.jpg"),
+            ],
+        }
+        assets, expected = post_assets_from_payloads([video_only, full], "MIXED3")
+        self.assertEqual(expected, 2)
+        self.assertEqual(slide_count(assets), 2)
+        self.assertIn("11", [asset.media_id for asset in assets])
 
     def test_html_script_and_marker_are_both_read(self) -> None:
         html = (

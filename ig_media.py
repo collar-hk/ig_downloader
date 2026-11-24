@@ -493,19 +493,65 @@ def post_assets_from_payloads(
     if not matched:
         return [], 0
 
-    best = max(matched, key=lambda node: (len(_explode(node)), _declared_count(node)))
+    # Prefer the parent carousel object over a nested single-slide copy of the same shortcode.
+    best = max(
+        matched,
+        key=lambda node: (
+            _declared_count(node),
+            len(_explode(node)),
+            1 if node.get("media_type") == 8 else 0,
+            1 if isinstance(node.get("carousel_media"), list) else 0,
+        ),
+    )
     default_username = _username_of(best)
     pieces = _explode(best)
     assets: list[MediaAsset] = []
     for piece in pieces:
         assets.extend(_assets_from_node(piece, default_username=default_username, story=False))
+
+    # If one payload only embedded the video slide, merge any other matching nodes'
+    # children so photo slides from a fuller copy of the post are kept.
+    best_ids = {asset.media_id for asset in assets}
+    for node in matched:
+        if node is best:
+            continue
+        if _declared_count(node) < _declared_count(best) and len(_explode(node)) <= len(pieces):
+            continue
+        for piece in _explode(node):
+            piece_assets = _assets_from_node(
+                piece,
+                default_username=default_username or _username_of(node),
+                story=False,
+            )
+            for asset in piece_assets:
+                if asset.media_id not in best_ids or asset.kind.endswith("Image"):
+                    assets.append(asset)
+                    best_ids.add(asset.media_id)
+
     unique = _dedupe_assets(assets)
-    # Thumbnails share a media id with the video; expected slide count ignores covers.
-    primary = [asset for asset in unique if asset.suffix != ".jpg" or asset.kind.endswith("Image")]
-    if not primary:
-        primary = unique
-    expected = max(_declared_count(best), len({asset.media_id for asset in primary}))
+    expected = max(_declared_count(best), slide_count(unique))
     return unique, expected
+
+
+def primary_assets(assets: list[MediaAsset]) -> list[MediaAsset]:
+    """Slides only: drop video cover jpgs that share a media id with the mp4."""
+    return [
+        asset
+        for asset in assets
+        if not (asset.suffix == ".jpg" and asset.kind.endswith("Video"))
+    ]
+
+
+def slide_count(assets: list[MediaAsset]) -> int:
+    """How many carousel/post slides ``assets`` represent."""
+    return len({asset.media_id for asset in primary_assets(assets)})
+
+
+def post_download_complete(assets: list[MediaAsset], expected: int, failures: list[str]) -> bool:
+    """True when every declared slide is present. Video thumbnails do not count as slides."""
+    if expected <= 0:
+        return bool(assets) and not failures
+    return slide_count(assets) >= expected and not failures
 
 
 def save_assets(

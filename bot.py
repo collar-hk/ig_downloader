@@ -42,8 +42,10 @@ from ig_media import (
     fetch_post_assets,
     parse_html_payloads,
     post_assets_from_payloads,
+    post_download_complete,
     save_assets,
     session_has_login,
+    slide_count,
     story_assets_from_payloads,
 )
 
@@ -313,12 +315,22 @@ def download_post_sync(shortcode: str, target_dir: str) -> int:
 
     # Prefer the media-info / Polaris APIs. HTML pages and Instaloader's
     # logged-in graphql/query path often redirect to the homepage now.
+    # Completeness is based on slide count, not file count: a video also saves a
+    # jpg cover, which used to look like a finished 2-slide carousel.
+    slides_found = 0
     try:
         assets, expected = fetch_post_assets(session, shortcode)
         if assets:
             saved, failures = save_assets(session, assets, target_dir, referer=referer)
-            logger.info("Post %s: API listed %s slide(s), saved %s", shortcode, expected, saved)
-            if saved and (expected <= saved):
+            slides_found = max(slides_found, slide_count(assets))
+            logger.info(
+                "Post %s: API listed %s slide(s), saved %s file(s) covering %s slide(s)",
+                shortcode,
+                expected,
+                saved,
+                slides_found,
+            )
+            if post_download_complete(assets, expected, failures):
                 return len(failures)
     except LoginRequired as exc:
         page_error = exc
@@ -329,7 +341,7 @@ def download_post_sync(shortcode: str, target_dir: str) -> int:
         page_error = exc
         logger.warning("Post %s API lookup failed: %s", shortcode, exc)
 
-    if saved == 0 or (expected and saved < expected):
+    if slides_found == 0 or (expected and slides_found < expected):
         for page_url in (
             f"https://www.instagram.com/p/{shortcode}/",
             f"https://www.instagram.com/reel/{shortcode}/",
@@ -350,12 +362,19 @@ def download_post_sync(shortcode: str, target_dir: str) -> int:
                 continue
             expected = max(expected, page_expected)
             saved, failures = save_assets(session, page_assets, target_dir, referer=page_url)
-            logger.info("Post %s: page listed %s slide(s), saved %s", shortcode, expected, saved)
-            if saved and (expected <= saved):
+            slides_found = max(slides_found, slide_count(page_assets))
+            logger.info(
+                "Post %s: page listed %s slide(s), saved %s file(s) covering %s slide(s)",
+                shortcode,
+                expected,
+                saved,
+                slides_found,
+            )
+            if post_download_complete(page_assets, expected, failures):
                 return len(failures)
             break
 
-    if saved == 0 or (expected and saved < expected):
+    if slides_found == 0 or (expected and slides_found < expected):
         try:
             before = _count_media(target_dir)
             loader, current_user = get_thread_safe_loader()
@@ -377,18 +396,19 @@ def download_post_sync(shortcode: str, target_dir: str) -> int:
                 current_user,
             )
             saved = after
+            slides_found = max(slides_found, after)
         except Exception as exc:
             logger.warning("Post %s instaloader fallback failed: %s", shortcode, exc)
             page_error = page_error or exc
 
-    if saved == 0 and _count_media(target_dir) <= 0:
+    if slides_found == 0 and _count_media(target_dir) <= 0:
         try:
             _download_post_ytdlp(shortcode, target_dir)
         except Exception as exc:
             logger.warning("Post %s yt-dlp fallback failed: %s", shortcode, exc)
             page_error = page_error or exc
 
-    if saved <= 0 and _count_media(target_dir) <= 0:
+    if _count_media(target_dir) <= 0:
         if isinstance(page_error, LoginRequired) or (
             page_error is not None and any(
                 token in _exc_blob(page_error).lower() for token in ("login", "cookie", "401", "403")
@@ -403,6 +423,10 @@ def download_post_sync(shortcode: str, target_dir: str) -> int:
                 kind="generic",
             ) from page_error
         raise DownloadError(_IG_USER_MESSAGES["generic"], kind="generic")
+    if expected and slides_found and slides_found < expected:
+        missing = expected - slides_found
+        failures.append(f"{missing} carousel slide(s) were missing from Instagram's response")
+        logger.warning("Post %s: only %s of %s slide(s) were saved", shortcode, slides_found, expected)
     return len(failures)
 
 
